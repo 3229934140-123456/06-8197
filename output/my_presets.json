@@ -1,0 +1,22 @@
+{
+  "warm-vocal": {
+    "description": "我的自定义预设 - 温暖人声",
+    "highpass": 150,
+    "lowpass": 5000,
+    "gain": 2,
+    "filter_domain": "time",
+    "kernel_size": 511
+  },
+  "my-custom": {
+    "description": "我的自定义预设",
+    "lowpass": 5000.0,
+    "highpass": 150.0,
+    "gain": 3.0,
+    "echo_delay": null,
+    "echo_decay": 0.5,
+    "echo_feedback": false,
+    "filter_domain": "time",
+    "kernel_size": null,
+    "window": "blackman"
+  }
+}

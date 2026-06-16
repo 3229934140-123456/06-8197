@@ -3,6 +3,9 @@ import cmath
 import wave
 import struct
 import random
+import os
+import csv
+import json
 
 
 def is_power_of_two(n):
@@ -76,10 +79,16 @@ def compute_signal_rms(signal):
     return math.sqrt(sum(s ** 2 for s in signal) / len(signal))
 
 
+def compute_signal_peak(signal):
+    if len(signal) == 0:
+        return 0.0
+    return max(abs(s) for s in signal)
+
+
 def normalize_signal(signal, target_peak=0.95):
     if len(signal) == 0:
         return signal
-    peak = max(abs(s) for s in signal)
+    peak = compute_signal_peak(signal)
     if peak < 1e-10:
         return signal
     scale = target_peak / peak
@@ -89,6 +98,7 @@ def normalize_signal(signal, target_peak=0.95):
 def compute_spectrum(signal, sample_rate, pad_to_power_of_two=True):
     n = len(signal)
     work_signal = list(signal)
+    original_n = n
     if pad_to_power_of_two and not is_power_of_two(n):
         padded_len = next_power_of_two(n)
         work_signal = work_signal + [0.0] * (padded_len - n)
@@ -96,7 +106,7 @@ def compute_spectrum(signal, sample_rate, pad_to_power_of_two=True):
 
     spectrum = fft(work_signal)
     magnitudes = [abs(s) for s in spectrum[:n // 2]]
-    normalized_magnitudes = [2.0 * m / len(signal) for m in magnitudes]
+    normalized_magnitudes = [2.0 * m / original_n for m in magnitudes]
     frequencies = [k * sample_rate / n for k in range(n // 2)]
     return frequencies, magnitudes, normalized_magnitudes, spectrum
 
@@ -155,16 +165,19 @@ def format_peak_table(peaks, title="频谱峰值"):
         return f"{title}: (未检测到显著峰值)\n"
 
     lines = [f"\n{title}:"]
-    lines.append("-" * 60)
-    lines.append(f"  {'序号':>4}  {'Bin':>6}  {'频率(Hz)':>12}  {'幅度':>10}  {'归一化幅度':>10}")
-    lines.append("-" * 60)
+    lines.append("-" * 65)
+    lines.append(f"  {'序号':>4}  {'Bin':>6}  {'频率(Hz)':>12}  {'幅度':>10}  {'归一化':>8}  {'dB':>8}")
+    lines.append("-" * 65)
+
+    max_mag = max(p['magnitude'] for p in peaks) if peaks else 1.0
 
     for i, p in enumerate(peaks, 1):
+        db = 20 * math.log10(p['magnitude'] / max_mag) if max_mag > 0 else -float('inf')
         lines.append(
             f"  {i:>4}  {p['bin']:>6}  {p['frequency']:>12.3f}  "
-            f"{p['magnitude']:>10.4f}  {p['normalized_magnitude']:>10.4f}"
+            f"{p['magnitude']:>10.4f}  {p['normalized_magnitude']:>8.4f}  {db:>+7.1f}"
         )
-    lines.append("-" * 60)
+    lines.append("-" * 65)
     return "\n".join(lines) + "\n"
 
 
@@ -182,9 +195,9 @@ def apply_freq_filter(signal, sample_rate, cutoff_freq, filter_type='lowpass',
     cutoff_bin = min(int(cutoff_freq * n / sample_rate), bins)
 
     if transition_width is None:
-        tw_bins = max(1, int(0.05 * bins))
+        tw_bins = max(2, int(0.02 * bins))
     else:
-        tw_bins = max(1, int(transition_width * n / sample_rate))
+        tw_bins = max(2, int(transition_width * n / sample_rate))
 
     filtered_spectrum = list(spectrum)
 
@@ -223,47 +236,65 @@ def apply_freq_filter(signal, sample_rate, cutoff_freq, filter_type='lowpass',
     return [s.real for s in filtered_signal[:original_n]]
 
 
-def _window_blackman(n, N):
-    return 0.42 - 0.5 * math.cos(2 * math.pi * n / (N - 1)) + \
-           0.08 * math.cos(4 * math.pi * n / (N - 1))
+WINDOW_PARAMS = {
+    'rectangular': {'beta': 0, 'transition_band': 1.8, 'stopband_atten': 21},
+    'hann': {'beta': 0, 'transition_band': 3.1, 'stopband_atten': 44},
+    'hamming': {'beta': 0, 'transition_band': 3.3, 'stopband_atten': 53},
+    'blackman': {'beta': 0, 'transition_band': 5.5, 'stopband_atten': 74},
+}
 
 
-def _window_hamming(n, N):
-    return 0.54 - 0.46 * math.cos(2 * math.pi * n / (N - 1))
+def _window_value(n, N, window_type='blackman'):
+    if window_type == 'blackman':
+        return 0.42 - 0.5 * math.cos(2 * math.pi * n / (N - 1)) + \
+               0.08 * math.cos(4 * math.pi * n / (N - 1))
+    elif window_type == 'hamming':
+        return 0.54 - 0.46 * math.cos(2 * math.pi * n / (N - 1))
+    elif window_type == 'hann':
+        return 0.5 * (1 - math.cos(2 * math.pi * n / (N - 1)))
+    elif window_type == 'rectangular':
+        return 1.0
+    else:
+        return 0.42 - 0.5 * math.cos(2 * math.pi * n / (N - 1)) + \
+               0.08 * math.cos(4 * math.pi * n / (N - 1))
 
 
-def create_lowpass_kernel(cutoff_freq, sample_rate, kernel_size=127,
+def estimate_filter_order(sample_rate, transition_width_hz,
                           window_type='blackman'):
+    params = WINDOW_PARAMS.get(window_type, WINDOW_PARAMS['blackman'])
+    tb_norm = transition_width_hz / (sample_rate / 2.0)
+    M = math.ceil(params['transition_band'] / tb_norm)
+    if M % 2 == 0:
+        M += 1
+    return M
+
+
+def create_lowpass_kernel(cutoff_freq, sample_rate, kernel_size=None,
+                          window_type='blackman', transition_width=None):
+    nyquist = sample_rate / 2.0
+
+    if kernel_size is None:
+        if transition_width is not None:
+            kernel_size = estimate_filter_order(sample_rate, transition_width, window_type)
+        else:
+            kernel_size = 511
+
     if kernel_size % 2 == 0:
         kernel_size += 1
 
-    nyquist = sample_rate / 2.0
     half = kernel_size // 2
-    kernel = []
-
     M = kernel_size - 1
-    if window_type == 'blackman':
-        bw = 5.5 / M
-    else:
-        bw = 3.3 / M
 
-    fc_corrected = (cutoff_freq + bw * nyquist / 2) / nyquist
-    fc = min(0.95, max(0.001, cutoff_freq / nyquist))
+    fc_norm = cutoff_freq / nyquist
 
+    kernel = []
     for i in range(kernel_size):
-        n = i - half
-        if n == 0:
-            h = 2 * fc
+        n_val = i - half
+        if n_val == 0:
+            h = fc_norm
         else:
-            h = math.sin(2 * math.pi * fc * n) / (math.pi * n)
-
-        if window_type == 'blackman':
-            w = _window_blackman(i, kernel_size)
-        elif window_type == 'hamming':
-            w = _window_hamming(i, kernel_size)
-        else:
-            w = 1.0
-
+            h = math.sin(math.pi * fc_norm * n_val) / (math.pi * n_val)
+        w = _window_value(i, kernel_size, window_type)
         kernel.append(h * w)
 
     total = sum(kernel)
@@ -273,13 +304,49 @@ def create_lowpass_kernel(cutoff_freq, sample_rate, kernel_size=127,
     return kernel
 
 
-def create_highpass_kernel(cutoff_freq, sample_rate, kernel_size=127,
-                           window_type='blackman'):
-    lowpass = create_lowpass_kernel(cutoff_freq, sample_rate, kernel_size, window_type)
+def create_highpass_kernel(cutoff_freq, sample_rate, kernel_size=None,
+                           window_type='blackman', transition_width=None):
+    lowpass = create_lowpass_kernel(cutoff_freq, sample_rate, kernel_size,
+                                    window_type, transition_width)
+    k_len = len(lowpass)
     highpass = [-k for k in lowpass]
-    mid = kernel_size // 2
+    mid = k_len // 2
     highpass[mid] += 1.0
     return highpass
+
+
+def create_bandstop_kernel(f_low, f_high, sample_rate, kernel_size=None,
+                           window_type='blackman'):
+    nyquist = sample_rate / 2.0
+
+    if kernel_size is None:
+        tw = min(f_low, sample_rate / 2 - f_high) * 0.5
+        kernel_size = estimate_filter_order(sample_rate, tw, window_type)
+
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    half = kernel_size // 2
+
+    fc1 = f_low / nyquist
+    fc2 = f_high / nyquist
+
+    kernel = []
+    for i in range(kernel_size):
+        n_val = i - half
+        if n_val == 0:
+            h = 1.0 - (fc2 - fc1)
+        else:
+            h = (math.sin(math.pi * n_val) - math.sin(math.pi * fc2 * n_val)
+                 + math.sin(math.pi * fc1 * n_val)) / (math.pi * n_val)
+        w = _window_value(i, kernel_size, window_type)
+        kernel.append(h * w)
+
+    total = sum(kernel)
+    if abs(total) > 1e-10:
+        kernel = [k / total for k in kernel]
+
+    return kernel
 
 
 def apply_time_filter(signal, kernel):
@@ -297,6 +364,25 @@ def apply_time_filter(signal, kernel):
         result[i] = s
 
     return result
+
+
+def compute_filter_response(kernel, sample_rate, n_fft=4096):
+    k_len = len(kernel)
+    padded = list(kernel) + [0.0] * (n_fft - k_len)
+    spectrum = fft(padded)
+    magnitudes = [abs(s) for s in spectrum[:n_fft // 2]]
+    max_mag = max(magnitudes) if max(magnitudes) > 0 else 1.0
+    magnitudes_db = [20 * math.log10(m / max_mag + 1e-20) for m in magnitudes]
+    frequencies = [k * sample_rate / n_fft for k in range(n_fft // 2)]
+    return frequencies, magnitudes, magnitudes_db
+
+
+def get_filter_cutoff_attenuation(kernel, sample_rate, target_freq):
+    freqs, _, mags_db = compute_filter_response(kernel, sample_rate, n_fft=16384)
+    for i in range(len(freqs)):
+        if freqs[i] >= target_freq:
+            return mags_db[i]
+    return mags_db[-1]
 
 
 def apply_gain(signal, gain_db):
@@ -377,10 +463,12 @@ def read_wav(file_path):
 
 
 def write_wav(file_path, signal, sample_rate, n_channels=1, normalize=True):
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True) if os.path.dirname(file_path) else None
+
     work_signal = list(signal)
 
     if normalize:
-        peak = max(abs(s) for s in work_signal) if work_signal else 0
+        peak = compute_signal_peak(work_signal)
         if peak > 1e-10 and peak > 0.95:
             scale = 0.95 / peak
             work_signal = [s * scale for s in work_signal]
@@ -422,3 +510,211 @@ def compute_band_energy(signal, sample_rate, freq_low, freq_high):
     if total_energy < 1e-20:
         return 0.0
     return band_energy / total_energy
+
+
+def analyze_signal_full(signal, sample_rate, label="", max_peaks=10,
+                        min_freq_separation=None):
+    rms = compute_signal_rms(signal)
+    peak = compute_signal_peak(signal)
+    duration = len(signal) / sample_rate if sample_rate > 0 else 0
+
+    freqs, mags, norm_mags, _ = compute_spectrum(signal, sample_rate)
+    peaks = find_spectrum_peaks(freqs, norm_mags, max_peaks=max_peaks,
+                                 min_freq_separation=min_freq_separation)
+
+    peak_freq = peaks[0]['frequency'] if peaks else 0.0
+    peak_mag = peaks[0]['magnitude'] if peaks else 0.0
+
+    low_band = compute_band_energy(signal, sample_rate, 0, 250)
+    mid_band = compute_band_energy(signal, sample_rate, 250, 2000)
+    high_band = compute_band_energy(signal, sample_rate, 2000, sample_rate / 2)
+
+    result = {
+        'label': label,
+        'sample_rate': sample_rate,
+        'n_samples': len(signal),
+        'duration': duration,
+        'rms': rms,
+        'peak': peak,
+        'peak_db': 20 * math.log10(peak) if peak > 0 else -float('inf'),
+        'crest_factor': peak / rms if rms > 0 else 0,
+        'dominant_freq': peak_freq,
+        'dominant_magnitude': peak_mag,
+        'peaks': peaks,
+        'band_energy_low': low_band,
+        'band_energy_mid': mid_band,
+        'band_energy_high': high_band,
+    }
+    return result
+
+
+def format_analysis_summary(analysis, show_peaks=True):
+    lines = []
+    label = analysis.get('label', '')
+    if label:
+        lines.append(f"[{label}]")
+        lines.append("-" * 55)
+
+    lines.append(f"  采样点数:     {analysis['n_samples']}")
+    lines.append(f"  时长:         {analysis['duration']:.3f} 秒")
+    lines.append(f"  采样率:       {analysis['sample_rate']} Hz")
+    lines.append(f"  RMS:          {analysis['rms']:.6f}")
+    lines.append(f"  峰值幅度:     {analysis['peak']:.6f}")
+    lines.append(f"  峰值/RMS 比:  {analysis['crest_factor']:.2f} ({20 * math.log10(analysis['crest_factor']):.1f} dB)")
+    lines.append(f"  主导频率:     {analysis['dominant_freq']:.2f} Hz")
+
+    lines.append(f"  频段能量分布: 低频 {analysis['band_energy_low']*100:.1f}% | "
+                 f"中频 {analysis['band_energy_mid']*100:.1f}% | "
+                 f"高频 {analysis['band_energy_high']*100:.1f}%")
+
+    if show_peaks and analysis['peaks']:
+        lines.append(format_peak_table(analysis['peaks'], title="频谱峰值"))
+
+    return "\n".join(lines)
+
+
+def export_spectrum_csv(file_path, analysis_info, signal=None, sample_rate=None,
+                        include_full_spectrum=False):
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True) if os.path.dirname(file_path) else None
+
+    with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+
+        writer.writerow(['=== 信号分析汇总 ==='])
+        writer.writerow(['项目', '值'])
+        for key in ['filename', 'sample_rate', 'n_samples', 'duration',
+                     'rms', 'peak', 'peak_db', 'crest_factor', 'dominant_freq',
+                     'band_energy_low', 'band_energy_mid', 'band_energy_high']:
+            if key in analysis_info:
+                writer.writerow([key, analysis_info[key]])
+
+        writer.writerow([])
+        writer.writerow(['=== 频谱峰值表 ==='])
+        writer.writerow(['排名', 'Bin索引', '频率(Hz)', '幅度', '归一化幅度', 'dB(相对于峰值)'])
+
+        max_mag = max((p['magnitude'] for p in analysis_info.get('peaks', [])), default=1.0)
+        for i, p in enumerate(analysis_info.get('peaks', []), 1):
+            db = 20 * math.log10(p['magnitude'] / max_mag) if max_mag > 0 else -float('inf')
+            writer.writerow([i, p['bin'], f"{p['frequency']:.4f}",
+                            f"{p['magnitude']:.6f}",
+                            f"{p['normalized_magnitude']:.6f}",
+                            f"{db:.2f}"])
+
+        if include_full_spectrum and signal is not None and sample_rate is not None:
+            freqs, mags, norm_mags, _ = compute_spectrum(signal, sample_rate)
+            writer.writerow([])
+            writer.writerow(['=== 完整频谱 ==='])
+            writer.writerow(['Bin', '频率(Hz)', '幅度', '归一化幅度'])
+            for i in range(len(freqs)):
+                writer.writerow([i, f"{freqs[i]:.4f}",
+                                f"{mags[i]:.6f}", f"{norm_mags[i]:.6f}"])
+
+
+def find_wav_files(directory):
+    if not os.path.isdir(directory):
+        return []
+    wav_files = []
+    for f in sorted(os.listdir(directory)):
+        if f.lower().endswith('.wav'):
+            wav_files.append(os.path.join(directory, f))
+    return wav_files
+
+
+DEFAULT_PRESETS = {
+    'vocal-clean': {
+        'description': '人声清洁：去除低频隆隆声和高频嘶声外的杂音',
+        'highpass': 80,
+        'lowpass': 8000,
+        'gain': 0,
+        'filter_domain': 'time',
+        'kernel_size': None,
+    },
+    'bass-cut': {
+        'description': '切除低音：去除 200Hz 以下的低频成分',
+        'highpass': 200,
+        'lowpass': None,
+        'gain': 0,
+        'filter_domain': 'time',
+        'kernel_size': 511,
+    },
+    'bright-boost': {
+        'description': '提升明亮度：高通+增益，让声音更亮',
+        'highpass': 300,
+        'lowpass': None,
+        'gain': 3,
+        'filter_domain': 'freq',
+    },
+    'warm-vintage': {
+        'description': '温暖复古：低通滤波去除高频',
+        'highpass': None,
+        'lowpass': 3000,
+        'gain': 0,
+        'filter_domain': 'time',
+    },
+    'echo-room': {
+        'description': '房间回声：中等延迟带反馈',
+        'echo_delay': 250,
+        'echo_decay': 0.4,
+        'echo_feedback': True,
+        'gain': 0,
+    },
+    'echo-cathedral': {
+        'description': '大教堂回声：长延迟高衰减',
+        'echo_delay': 800,
+        'echo_decay': 0.55,
+        'echo_feedback': True,
+        'gain': -2,
+    },
+    'telephone': {
+        'description': '电话音效果：带通滤波',
+        'highpass': 300,
+        'lowpass': 3400,
+        'gain': 0,
+        'filter_domain': 'freq',
+    },
+    'subwoofer-test': {
+        'description': '低音炮测试：只保留超低频',
+        'highpass': None,
+        'lowpass': 120,
+        'gain': 6,
+        'filter_domain': 'time',
+        'kernel_size': 1023,
+    },
+}
+
+
+def load_presets(custom_file=None):
+    presets = dict(DEFAULT_PRESETS)
+    if custom_file and os.path.exists(custom_file):
+        try:
+            with open(custom_file, 'r', encoding='utf-8') as f:
+                custom = json.load(f)
+            presets.update(custom)
+        except Exception:
+            pass
+    return presets
+
+
+def save_preset(name, config, custom_file='custom_presets.json'):
+    presets = {}
+    if os.path.exists(custom_file):
+        try:
+            with open(custom_file, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+        except Exception:
+            presets = {}
+
+    presets[name] = config
+
+    with open(custom_file, 'w', encoding='utf-8') as f:
+        json.dump(presets, f, indent=2, ensure_ascii=False)
+
+
+def list_presets(presets=None):
+    if presets is None:
+        presets = load_presets()
+    lines = ["可用预设:"]
+    for name, cfg in presets.items():
+        desc = cfg.get('description', '')
+        lines.append(f"  {name:20s} - {desc}")
+    return "\n".join(lines)
