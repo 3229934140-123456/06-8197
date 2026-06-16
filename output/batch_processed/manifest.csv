@@ -1,0 +1,11 @@
+﻿=== 处理信息 ===
+任务类型,完整处理流水线
+处理步骤,高通150Hz → 低通3500Hz → 增益+2.0dB
+输入目录,output\batch_in
+输出目录,output\batch_processed
+
+=== 处理清单 ===
+文件名,输入路径,输出路径,状态,处理步骤,输入RMS,输出RMS,RMS变化(dB),原主导频率(Hz),新主导频率(Hz),采样率,时长(s),声道数,输入峰值,输出峰值
+tone_a.wav,D:\trae-bz\TraeProjects\8197\output\batch_in\tone_a.wav,D:\trae-bz\TraeProjects\8197\output\batch_processed\tone_a.wav,成功,高通150Hz → 低通3500Hz → 增益+2.0dB,0.5014684472344134,0.28844843217148514,-4.803508586871451,100.26,440.08,22050,1.0,1,0.949951171875,0.5211518231818453
+tone_b.wav,D:\trae-bz\TraeProjects\8197\output\batch_in\tone_b.wav,D:\trae-bz\TraeProjects\8197\output\batch_processed\tone_b.wav,成功,高通150Hz → 低通3500Hz → 增益+2.0dB,0.4999492465483641,0.6279269604755343,1.9796642396036788,250.32,250.32,22050,1.0,1,0.949951171875,1.2027282259295713
+tone_c.wav,D:\trae-bz\TraeProjects\8197\output\batch_in\tone_c.wav,D:\trae-bz\TraeProjects\8197\output\batch_processed\tone_c.wav,成功,高通150Hz → 低通3500Hz → 增益+2.0dB,0.5396447380961708,0.6792566494612375,1.998519036170192,440.08,440.08,22050,1.0,1,0.949951171875,1.2125020343749402

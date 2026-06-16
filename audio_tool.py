@@ -30,6 +30,10 @@ from audio_engine import (
     list_presets,
     compute_filter_response,
     get_filter_cutoff_attenuation,
+    show_preset_details,
+    copy_preset,
+    format_batch_summary,
+    write_batch_manifest,
 )
 
 
@@ -53,7 +57,7 @@ def parse_freq_list(s):
             "频率列表格式应为 'freq:amp,freq:amp,...'")
 
 
-def apply_preset_to_args(args, preset_name, presets):
+def apply_preset_to_args(args, preset_name, presets, overwrite=False):
     if preset_name not in presets:
         print(f"错误: 预设 '{preset_name}' 不存在")
         print(list_presets(presets))
@@ -61,14 +65,128 @@ def apply_preset_to_args(args, preset_name, presets):
 
     preset = presets[preset_name]
     print(f"已应用预设: {preset_name} - {preset.get('description', '')}")
+    if overwrite:
+        print("  (模式: 完整覆盖默认参数)")
+    else:
+        print("  (模式: 仅填充未设置的参数)")
 
+    applied_keys = []
     for key, value in preset.items():
         if key == 'description':
             continue
-        if not hasattr(args, key) or getattr(args, key) is None:
-            setattr(args, key, value)
+        if not hasattr(args, key):
+            continue
+        current = getattr(args, key)
+        if overwrite:
+            if current is None or (isinstance(current, (int, float)) and (key == 'gain' and current == 0)):
+                setattr(args, key, value)
+                applied_keys.append(key)
+            elif key in ('echo_decay', 'filter_domain', 'window'):
+                setattr(args, key, value)
+                applied_keys.append(key)
+        else:
+            is_default = (current is None)
+            if key == 'gain' and current == 0:
+                is_default = True
+            if key == 'echo_decay' and current == 0.5:
+                is_default = True
+            if key == 'filter_domain' and current == 'time':
+                is_default = True
+            if key == 'window' and current == 'blackman':
+                is_default = True
+            if is_default:
+                setattr(args, key, value)
+                applied_keys.append(key)
+
+    if applied_keys:
+        print(f"  应用参数: {', '.join(applied_keys)}")
 
     return args
+
+
+def describe_process_steps(args):
+    steps = []
+    if hasattr(args, 'type') and hasattr(args, 'cutoff'):
+        prefix = '低通' if args.type == 'lowpass' else '高通'
+        ks = getattr(args, 'kernel_size', None)
+        ks_suffix = f"({ks}抽头)" if ks and getattr(args, 'domain', 'time') == 'time' else ''
+        steps.append(f"{prefix}{int(args.cutoff)}Hz{ks_suffix}")
+    else:
+        if getattr(args, 'highpass', None) is not None:
+            steps.append(f"高通{int(args.highpass)}Hz")
+        if getattr(args, 'lowpass', None) is not None:
+            steps.append(f"低通{int(args.lowpass)}Hz")
+    if hasattr(args, 'gain') and getattr(args, 'gain', 0) != 0:
+        steps.append(f"增益{args.gain:+.1f}dB")
+    echo_delay = getattr(args, 'delay', None) if hasattr(args, 'delay') else getattr(args, 'echo_delay', None)
+    if echo_delay is not None:
+        echo_decay = getattr(args, 'decay', 0.5) if hasattr(args, 'decay') else getattr(args, 'echo_decay', 0.5)
+        fb = getattr(args, 'feedback', False) if hasattr(args, 'feedback') else getattr(args, 'echo_feedback', False)
+        steps.append(f"回声{int(echo_delay)}ms×{echo_decay:.2f}{'+FB' if fb else ''}")
+    return steps
+
+
+def print_dry_run_plan(wav_files, output_dir, steps_str, naming_pattern="{fname}"):
+    print()
+    print_sep("-")
+    print("  Dry-Run 执行计划 (不实际写文件)")
+    print_sep("-")
+    print(f"  处理文件数: {len(wav_files)}")
+    print(f"  输出目录:   {output_dir}")
+    print(f"  处理步骤:   {steps_str if steps_str else '(无处理)'}")
+    print(f"  命名模式:   {naming_pattern}")
+    print()
+    print(f"  {'#':>3}  {'原文件名':<30}  ->  输出文件名")
+    print(f"  {'-':>3}  {'-':-<30}      {'-':-<30}")
+    for i, fp in enumerate(wav_files, 1):
+        fname = os.path.basename(fp)
+        base, ext = os.path.splitext(fname)
+        out_name = naming_pattern.format(fname=fname, base=base, ext=ext, ext_no_dot=ext[1:])
+        print(f"  {i:>3}  {fname:<30}  ->  {out_name}")
+    print()
+    print("  如需执行，请移除 --dry-run 参数")
+    print_sep("-")
+
+
+def build_output_filename(fname, args, op_type=None):
+    base, ext = os.path.splitext(fname)
+    prefix_parts = []
+    if op_type == 'filter':
+        ftype_label = 'lp' if args.type == 'lowpass' else 'hp'
+        prefix_parts.append(f"{ftype_label}_{int(args.cutoff)}Hz")
+    elif op_type == 'gain':
+        prefix_parts.append(f"g{args.gain:+.0f}dB")
+    elif op_type == 'echo':
+        fb = 'fb' if args.feedback else 's'
+        prefix_parts.append(f"echo_{int(args.delay)}ms{fb}")
+    elif op_type == 'process':
+        if getattr(args, 'highpass', None):
+            prefix_parts.append(f"hp{int(args.highpass)}")
+        if getattr(args, 'lowpass', None):
+            prefix_parts.append(f"lp{int(args.lowpass)}")
+        if getattr(args, 'gain', 0) != 0:
+            prefix_parts.append(f"g{args.gain:+.0f}dB")
+        if getattr(args, 'echo_delay', None):
+            prefix_parts.append(f"echo")
+    if getattr(args, 'preserve_name', True):
+        return fname
+    if prefix_parts:
+        return f"{'_'.join(prefix_parts)}_{fname}"
+    return fname
+
+
+def finalize_batch_results(results, output_dir, extra_info=None, manifest_name='manifest.csv'):
+    print(format_batch_summary(results))
+    os.makedirs(output_dir, exist_ok=True)
+    manifest_path = os.path.join(output_dir, manifest_name)
+    try:
+        write_batch_manifest(manifest_path, results, extra_info=extra_info)
+        print(f"\n处理清单已保存到: {manifest_path}")
+    except Exception as e:
+        print(f"\n警告: 保存清单失败: {e}")
+    success_count = sum(1 for r in results if r.get('status') in ('成功', 'OK'))
+    total_count = len(results)
+    print(f"\n共成功处理 {success_count}/{total_count} 个文件")
 
 
 def run_analysis_on_file(filepath, max_peaks=10, label=None):
@@ -153,6 +271,12 @@ def run_batch_analyze(args):
         print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
         sys.exit(1)
 
+    steps_str = "频谱分析"
+
+    if getattr(args, 'dry_run', False):
+        print_dry_run_plan(wav_files, output_dir, steps_str)
+        return None, None
+
     print(f"\n批量分析目录: {input_dir}")
     print(f"找到 {len(wav_files)} 个 WAV 文件")
     print(f"输出目录: {output_dir}")
@@ -161,56 +285,69 @@ def run_batch_analyze(args):
     for i, filepath in enumerate(wav_files, 1):
         fname = os.path.basename(filepath)
         print(f"\n[{i}/{len(wav_files)}] 处理: {fname}")
+        result = {
+            'filename': fname,
+            'input_path': os.path.abspath(filepath),
+            'output_path': '',
+            'steps': steps_str,
+            'status': '处理中',
+        }
         try:
             analysis, signal, sr, ch = run_analysis_on_file(
                 filepath, max_peaks=args.max_peaks, label=fname)
-            results.append(analysis)
+            result.update({
+                'sample_rate': sr,
+                'duration': analysis['duration'],
+                'channels': ch,
+                'rms_in': analysis['rms'],
+                'rms_out': analysis['rms'],
+                'rms_change_db': 0.0,
+                'peak_in': analysis['peak'],
+                'peak_out': analysis['peak'],
+                'dominant_in': round(analysis['dominant_freq'], 2),
+                'dominant_out': round(analysis['dominant_freq'], 2),
+            })
 
-            if args.csv_each:
-                csv_path = os.path.join(output_dir, os.path.splitext(fname)[0] + '.csv')
+            csv_name = os.path.splitext(fname)[0] + '.csv'
+            csv_path = os.path.join(output_dir, csv_name)
+            result['output_path'] = os.path.abspath(csv_path)
+            if getattr(args, 'csv_each', False):
                 export_spectrum_csv(csv_path, analysis, signal=signal,
                                    sample_rate=sr,
-                                   include_full_spectrum=args.full_csv)
-
+                                   include_full_spectrum=getattr(args, 'full_csv', False))
+            result['status'] = '成功'
         except Exception as e:
+            result['status'] = '失败'
+            result['error_msg'] = str(e)
             print(f"  跳过 (错误: {e})")
+        results.append(result)
 
     if results:
-        print()
-        print_sep("-")
-        print("  批量分析汇总表")
-        print_sep("-")
-
-        header = f"  {'文件名':<30} {'时长(s)':>8} {'RMS':>8} {'峰值':>8} {'主导频率(Hz)':>14} {'低频%':>7} {'中频%':>7} {'高频%':>7}"
-        print(header)
-        print("  " + "-" * (len(header) - 2))
-
-        for r in results:
-            print(f"  {r['filename']:<30} {r['duration']:>8.2f} {r['rms']:>8.4f} "
-                  f"{r['peak']:>8.4f} {r['dominant_freq']:>14.2f} "
-                  f"{r['band_energy_low']*100:>6.1f}% "
-                  f"{r['band_energy_mid']*100:>6.1f}% "
-                  f"{r['band_energy_high']*100:>6.1f}%")
-
         summary_csv = os.path.join(output_dir, 'summary.csv')
         with open(summary_csv, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             writer.writerow(['文件名', '采样率', '采样点数', '时长(s)', 'RMS',
                            '峰值', '峰值(dB)', '峰值/RMS比', '主导频率(Hz)',
                            '低频能量%', '中频能量%', '高频能量%'])
-            for r in results:
-                writer.writerow([
-                    r['filename'], r['sample_rate'], r['n_samples'],
-                    f"{r['duration']:.4f}", f"{r['rms']:.6f}",
-                    f"{r['peak']:.6f}", f"{r['peak_db']:.2f}",
-                    f"{r['crest_factor']:.4f}", f"{r['dominant_freq']:.2f}",
-                    f"{r['band_energy_low']*100:.2f}",
-                    f"{r['band_energy_mid']*100:.2f}",
-                    f"{r['band_energy_high']*100:.2f}",
-                ])
+            for i, r in enumerate(results):
+                if r['status'] == '成功':
+                    _, signal, sr, _ = run_analysis_on_file(wav_files[i], max_peaks=args.max_peaks)
+                    a = analyze_signal_full(signal, sr)
+                    writer.writerow([
+                        r['filename'], r['sample_rate'], a['n_samples'],
+                        f"{a['duration']:.4f}", f"{a['rms']:.6f}",
+                        f"{a['peak']:.6f}", f"{a['peak_db']:.2f}",
+                        f"{a['crest_factor']:.4f}", f"{a['dominant_freq']:.2f}",
+                        f"{a['band_energy_low']*100:.2f}",
+                        f"{a['band_energy_mid']*100:.2f}",
+                        f"{a['band_energy_high']*100:.2f}",
+                    ])
+                else:
+                    writer.writerow([r['filename']] + [''] * 11)
         print(f"\n汇总表已保存到: {summary_csv}")
 
-    print(f"\n共成功处理 {len(results)}/{len(wav_files)} 个文件")
+    extra_info = {'任务类型': '频谱分析', '输入目录': input_dir, '输出目录': output_dir}
+    finalize_batch_results(results, output_dir, extra_info=extra_info)
     return None, None
 
 
@@ -309,20 +446,37 @@ def run_batch_filter(args):
         sys.exit(1)
 
     ftype_label = '低通' if args.type == 'lowpass' else '高通'
+    steps_list = describe_process_steps(args)
+    steps_str = " → ".join(steps_list) if steps_list else f"{ftype_label}{int(args.cutoff)}Hz"
+
+    if getattr(args, 'dry_run', False):
+        print_dry_run_plan(wav_files, output_dir, steps_str)
+        return None, None
+
     print(f"\n批量{ftype_label}滤波目录: {input_dir}")
     print(f"截止频率: {args.cutoff} Hz, 方式: {args.domain}")
+    print(f"处理步骤: {steps_str}")
     print(f"找到 {len(wav_files)} 个 WAV 文件")
     print(f"输出目录: {output_dir}")
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
         fname = os.path.basename(filepath)
-        out_name = f"filtered_{ftype_label}_{int(args.cutoff)}Hz_{fname}"
+        out_name = build_output_filename(fname, args, op_type='filter')
         out_path = os.path.join(output_dir, out_name)
 
         print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        result = {
+            'filename': fname,
+            'input_path': os.path.abspath(filepath),
+            'output_path': os.path.abspath(out_path),
+            'steps': steps_str,
+            'status': '处理中',
+        }
         try:
             signal, sr, ch = read_wav(filepath)
+            rms_in = compute_signal_rms(signal)
+            a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
 
             if args.type == 'lowpass':
                 if args.domain == 'freq':
@@ -343,30 +497,36 @@ def run_batch_filter(args):
 
             write_wav(out_path, filtered, sr, n_channels=ch)
 
-            rms_in = compute_signal_rms(signal)
             rms_out = compute_signal_rms(filtered)
-            results.append({
-                'filename': fname,
+            a_out = analyze_signal_full(filtered, sr, max_peaks=args.max_peaks)
+
+            result.update({
+                'sample_rate': sr,
+                'duration': a_in['duration'],
+                'channels': ch,
                 'rms_in': rms_in,
                 'rms_out': rms_out,
                 'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
+                'peak_in': a_in['peak'],
+                'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2),
+                'dominant_out': round(a_out['dominant_freq'], 2),
+                'status': '成功',
             })
-
         except Exception as e:
+            result['status'] = '失败'
+            result['error_msg'] = str(e)
             print(f"  跳过 (错误: {e})")
+        results.append(result)
 
-    if results:
-        print()
-        print_sep("-")
-        print("  批量滤波汇总表")
-        print_sep("-")
-        print(f"  {'文件名':<30} {'输入RMS':>10} {'输出RMS':>10} {'变化(dB)':>10}")
-        print("  " + "-" * 62)
-        for r in results:
-            print(f"  {r['filename']:<30} {r['rms_in']:>10.4f} {r['rms_out']:>10.4f} "
-                  f"{r['rms_change_db']:>+9.2f}")
-
-    print(f"\n共成功处理 {len(results)}/{len(wav_files)} 个文件")
+    extra_info = {
+        '任务类型': f'{ftype_label}滤波',
+        '截止频率(Hz)': args.cutoff,
+        '实现方式': args.domain,
+        '输入目录': input_dir,
+        '输出目录': output_dir,
+    }
+    finalize_batch_results(results, output_dir, extra_info=extra_info)
     return None, None
 
 
@@ -410,7 +570,15 @@ def run_batch_gain(args):
         print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
         sys.exit(1)
 
+    steps_list = describe_process_steps(args)
+    steps_str = " → ".join(steps_list)
+
+    if getattr(args, 'dry_run', False):
+        print_dry_run_plan(wav_files, output_dir, steps_str)
+        return None, None
+
     print(f"\n批量增益调整: {args.gain:+.2f} dB")
+    print(f"处理步骤: {steps_str}")
     print(f"输入目录: {input_dir}")
     print(f"找到 {len(wav_files)} 个 WAV 文件")
     print(f"输出目录: {output_dir}")
@@ -418,21 +586,53 @@ def run_batch_gain(args):
     results = []
     for i, filepath in enumerate(wav_files, 1):
         fname = os.path.basename(filepath)
-        out_name = f"gain_{args.gain:+.0f}dB_{fname}"
+        out_name = build_output_filename(fname, args, op_type='gain')
         out_path = os.path.join(output_dir, out_name)
 
-        print(f"[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        result = {
+            'filename': fname,
+            'input_path': os.path.abspath(filepath),
+            'output_path': os.path.abspath(out_path),
+            'steps': steps_str,
+            'status': '处理中',
+        }
         try:
             signal, sr, ch = read_wav(filepath)
+            a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
             gained = apply_gain(signal, args.gain)
             write_wav(out_path, gained, sr, n_channels=ch)
-            results.append({'filename': fname,
-                          'rms_in': compute_signal_rms(signal),
-                          'rms_out': compute_signal_rms(gained)})
-        except Exception as e:
-            print(f"  跳过 (错误: {e})")
+            a_out = analyze_signal_full(gained, sr, max_peaks=args.max_peaks)
 
-    print(f"\n共成功处理 {len(results)}/{len(wav_files)} 个文件")
+            rms_in = a_in['rms']
+            rms_out = a_out['rms']
+
+            result.update({
+                'sample_rate': sr,
+                'duration': a_in['duration'],
+                'channels': ch,
+                'rms_in': rms_in,
+                'rms_out': rms_out,
+                'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
+                'peak_in': a_in['peak'],
+                'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2),
+                'dominant_out': round(a_out['dominant_freq'], 2),
+                'status': '成功',
+            })
+        except Exception as e:
+            result['status'] = '失败'
+            result['error_msg'] = str(e)
+            print(f"  跳过 (错误: {e})")
+        results.append(result)
+
+    extra_info = {
+        '任务类型': '增益调整',
+        '增益(dB)': args.gain,
+        '输入目录': input_dir,
+        '输出目录': output_dir,
+    }
+    finalize_batch_results(results, output_dir, extra_info=extra_info)
     return None, None
 
 
@@ -480,8 +680,16 @@ def run_batch_echo(args):
         print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
         sys.exit(1)
 
-    echo_type = "feedback" if args.feedback else "simple"
-    print(f"\n批量回声效果: 延迟 {args.delay}ms, 衰减 {args.decay}, 模式 {echo_type}")
+    steps_list = describe_process_steps(args)
+    steps_str = " → ".join(steps_list)
+    echo_type = "反馈式" if args.feedback else "单次"
+
+    if getattr(args, 'dry_run', False):
+        print_dry_run_plan(wav_files, output_dir, steps_str)
+        return None, None
+
+    print(f"\n批量回声效果: {echo_type} 延迟 {args.delay}ms, 衰减 {args.decay}")
+    print(f"处理步骤: {steps_str}")
     print(f"输入目录: {input_dir}")
     print(f"找到 {len(wav_files)} 个 WAV 文件")
     print(f"输出目录: {output_dir}")
@@ -489,20 +697,55 @@ def run_batch_echo(args):
     results = []
     for i, filepath in enumerate(wav_files, 1):
         fname = os.path.basename(filepath)
-        out_name = f"echo_{echo_type}_{int(args.delay)}ms_{fname}"
+        out_name = build_output_filename(fname, args, op_type='echo')
         out_path = os.path.join(output_dir, out_name)
 
-        print(f"[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        result = {
+            'filename': fname,
+            'input_path': os.path.abspath(filepath),
+            'output_path': os.path.abspath(out_path),
+            'steps': steps_str,
+            'status': '处理中',
+        }
         try:
             signal, sr, ch = read_wav(filepath)
-            echoed = apply_echo(signal, sr, args.delay, args.decay,
-                                feedback=args.feedback)
+            a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
+            echoed = apply_echo(signal, sr, args.delay, args.decay, feedback=args.feedback)
             write_wav(out_path, echoed, sr, n_channels=ch)
-            results.append({'filename': fname})
-        except Exception as e:
-            print(f"  跳过 (错误: {e})")
+            a_out = analyze_signal_full(echoed, sr, max_peaks=args.max_peaks)
 
-    print(f"\n共成功处理 {len(results)}/{len(wav_files)} 个文件")
+            rms_in = a_in['rms']
+            rms_out = a_out['rms']
+
+            result.update({
+                'sample_rate': sr,
+                'duration': a_in['duration'],
+                'channels': ch,
+                'rms_in': rms_in,
+                'rms_out': rms_out,
+                'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
+                'peak_in': a_in['peak'],
+                'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2),
+                'dominant_out': round(a_out['dominant_freq'], 2),
+                'status': '成功',
+            })
+        except Exception as e:
+            result['status'] = '失败'
+            result['error_msg'] = str(e)
+            print(f"  跳过 (错误: {e})")
+        results.append(result)
+
+    extra_info = {
+        '任务类型': '回声效果',
+        '延迟(ms)': args.delay,
+        '衰减系数': args.decay,
+        '反馈模式': '开启' if args.feedback else '关闭',
+        '输入目录': input_dir,
+        '输出目录': output_dir,
+    }
+    finalize_batch_results(results, output_dir, extra_info=extra_info)
     return None, None
 
 
@@ -514,9 +757,13 @@ def run_process(args):
     sample_rate = args.sample_rate
     channels = 1
 
+    if args.input and os.path.isdir(args.input):
+        return run_batch_process(args)
+
     if args.preset:
         presets = load_presets(args.preset_file)
-        apply_preset_to_args(args, args.preset, presets)
+        overwrite = getattr(args, 'preset_overwrite', True)
+        apply_preset_to_args(args, args.preset, presets, overwrite=overwrite)
 
     if args.input:
         if os.path.isdir(args.input):
@@ -646,20 +893,41 @@ def run_batch_process(args):
         print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
         sys.exit(1)
 
+    if args.preset:
+        presets = load_presets(args.preset_file)
+        overwrite = getattr(args, 'preset_overwrite', True)
+        apply_preset_to_args(args, args.preset, presets, overwrite=overwrite)
+
+    steps_list = describe_process_steps(args)
+    steps_str = " → ".join(steps_list) if steps_list else "(仅读写)"
+
+    if getattr(args, 'dry_run', False):
+        print_dry_run_plan(wav_files, output_dir, steps_str)
+        return None, None
+
     print(f"\n批量处理目录: {input_dir}")
+    print(f"处理步骤: {steps_str}")
     print(f"找到 {len(wav_files)} 个 WAV 文件")
     print(f"输出目录: {output_dir}")
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
         fname = os.path.basename(filepath)
-        out_name = f"processed_{fname}"
+        out_name = build_output_filename(fname, args, op_type='process')
         out_path = os.path.join(output_dir, out_name)
 
-        print(f"\n[{i}/{len(wav_files)}] 处理: {fname}")
+        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        result = {
+            'filename': fname,
+            'input_path': os.path.abspath(filepath),
+            'output_path': os.path.abspath(out_path),
+            'steps': steps_str,
+            'status': '处理中',
+        }
         try:
             signal, sr, ch = read_wav(filepath)
             current = signal
+            a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
 
             if args.highpass is not None:
                 if args.filter_domain == 'freq':
@@ -687,14 +955,39 @@ def run_batch_process(args):
                                     feedback=args.echo_feedback)
 
             write_wav(out_path, current, sr, n_channels=ch)
-            results.append({'filename': fname,
-                          'rms_in': compute_signal_rms(signal),
-                          'rms_out': compute_signal_rms(current)})
+            a_out = analyze_signal_full(current, sr, max_peaks=args.max_peaks)
 
+            rms_in = a_in['rms']
+            rms_out = a_out['rms']
+
+            result.update({
+                'sample_rate': sr,
+                'duration': a_in['duration'],
+                'channels': ch,
+                'rms_in': rms_in,
+                'rms_out': rms_out,
+                'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
+                'peak_in': a_in['peak'],
+                'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2),
+                'dominant_out': round(a_out['dominant_freq'], 2),
+                'status': '成功',
+            })
         except Exception as e:
+            result['status'] = '失败'
+            result['error_msg'] = str(e)
             print(f"  跳过 (错误: {e})")
+        results.append(result)
 
-    print(f"\n共成功处理 {len(results)}/{len(wav_files)} 个文件")
+    extra_info = {
+        '任务类型': '完整处理流水线',
+        '处理步骤': steps_str,
+        '输入目录': input_dir,
+        '输出目录': output_dir,
+    }
+    if args.preset:
+        extra_info['使用预设'] = args.preset
+    finalize_batch_results(results, output_dir, extra_info=extra_info)
     return None, None
 
 
@@ -706,6 +999,49 @@ def run_presets_list(args):
     print()
     print(list_presets(presets))
     print()
+    print(f"共 {len(presets)} 个预设 (含 {len(presets) - 8} 个自定义)")
+    print()
+
+
+def run_presets_show(args):
+    presets = load_presets(args.preset_file)
+    print_sep()
+    print("  预设详情")
+    print_sep()
+    print()
+    for name in args.names:
+        print(show_preset_details(name, presets))
+        print()
+        print_sep("-")
+        print()
+
+
+def run_presets_copy(args):
+    presets = load_presets(args.preset_file)
+    print_sep()
+    print("  复制预设")
+    print_sep()
+    if args.src not in presets:
+        print(f"错误: 源预设 '{args.src}' 不存在")
+        print(list_presets(presets))
+        sys.exit(1)
+    if args.dst in presets and not args.force:
+        print(f"错误: 目标预设 '{args.dst}' 已存在, 使用 --force 覆盖")
+        sys.exit(1)
+    try:
+        desc = args.description if args.description else f"复制自 '{args.src}'"
+        cfg = copy_preset(args.src, args.dst, args.preset_file, description=desc, presets=presets)
+        print(f"\n✓ 已复制预设:")
+        print(f"  源:   {args.src}")
+        print(f"  目标: {args.dst}")
+        if args.description:
+            print(f"  描述: {desc}")
+        print(f"  文件: {args.preset_file}")
+        print()
+        print(show_preset_details(args.dst, load_presets(args.preset_file)))
+    except Exception as e:
+        print(f"复制失败: {e}")
+        sys.exit(1)
 
 
 def add_common_input_args(parser, add_output=True):
@@ -717,6 +1053,12 @@ def add_common_input_args(parser, add_output=True):
     parser.add_argument("--full-csv", action="store_true", help="CSV 包含完整频谱数据")
     parser.add_argument("--preset-file", type=str, default='custom_presets.json',
                         help="自定义预设文件")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="仅显示执行计划, 不实际写文件")
+    parser.add_argument("--preserve-name", dest="preserve_name", action="store_true", default=True,
+                        help="批量输出时保留原文件名 (默认)")
+    parser.add_argument("--no-preserve-name", dest="preserve_name", action="store_false",
+                        help="批量输出时在文件名前加处理类型前缀")
 
 
 def main():
@@ -835,12 +1177,22 @@ def main():
     p_proc.add_argument("--csv", type=str, default=None, help="导出频谱 CSV")
     p_proc.add_argument("--full-csv", action="store_true", help="完整频谱 CSV")
     p_proc.add_argument("--preset", type=str, default=None, help="应用预设")
+    p_proc.add_argument("--preset-overwrite", dest="preset_overwrite", action="store_true", default=True,
+                        help="预设参数完整覆盖默认值 (默认)")
+    p_proc.add_argument("--preset-no-overwrite", dest="preset_overwrite", action="store_false",
+                        help="预设参数仅填充未设置的值")
     p_proc.add_argument("--preset-file", type=str, default='custom_presets.json',
                         help="自定义预设文件")
     p_proc.add_argument("--save-preset", type=str, default=None,
                         help="保存当前参数为预设")
     p_proc.add_argument("--save-preset-desc", type=str, default=None,
                         help="预设描述")
+    p_proc.add_argument("--dry-run", action="store_true",
+                        help="仅显示执行计划")
+    p_proc.add_argument("--preserve-name", dest="preserve_name", action="store_true", default=True,
+                        help="批量输出保留原文件名 (默认)")
+    p_proc.add_argument("--no-preserve-name", dest="preserve_name", action="store_false",
+                        help="批量输出加前缀")
 
     # ============ presets ============
     p_pre = subparsers.add_parser("presets", help="预设管理")
@@ -848,6 +1200,19 @@ def main():
     p_pre_list = p_pre_sub.add_parser("list", help="列出所有预设")
     p_pre_list.add_argument("--preset-file", type=str, default='custom_presets.json',
                            help="自定义预设文件")
+    p_pre_show = p_pre_sub.add_parser("show", help="查看预设详细参数")
+    p_pre_show.add_argument("names", nargs="+", help="预设名称 (可多个)")
+    p_pre_show.add_argument("--preset-file", type=str, default='custom_presets.json',
+                           help="自定义预设文件")
+    p_pre_copy = p_pre_sub.add_parser("copy", help="复制预设并改名保存")
+    p_pre_copy.add_argument("src", help="源预设名称")
+    p_pre_copy.add_argument("dst", help="新预设名称")
+    p_pre_copy.add_argument("-d", "--description", type=str, default=None,
+                           help="新预设描述")
+    p_pre_copy.add_argument("-f", "--force", action="store_true",
+                           help="若目标预设已存在则覆盖")
+    p_pre_copy.add_argument("--preset-file", type=str, default='custom_presets.json',
+                           help="自定义预设文件 (保存位置)")
 
     args = parser.parse_args()
 
@@ -867,6 +1232,10 @@ def main():
     if args.command == "presets":
         if args.preset_cmd == "list":
             run_presets_list(args)
+        elif args.preset_cmd == "show":
+            run_presets_show(args)
+        elif args.preset_cmd == "copy":
+            run_presets_copy(args)
         else:
             p_pre.print_help()
         return

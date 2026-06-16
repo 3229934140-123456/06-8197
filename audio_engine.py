@@ -718,3 +718,161 @@ def list_presets(presets=None):
         desc = cfg.get('description', '')
         lines.append(f"  {name:20s} - {desc}")
     return "\n".join(lines)
+
+
+def show_preset_details(name, presets=None):
+    if presets is None:
+        presets = load_presets()
+    if name not in presets:
+        return f"错误: 预设 '{name}' 不存在"
+    cfg = presets[name]
+    lines = [f"预设名称: {name}"]
+    lines.append(f"描述:     {cfg.get('description', '(无)')}")
+    lines.append("")
+    lines.append("参数配置:")
+    key_labels = {
+        'highpass': '高通截止频率',
+        'lowpass': '低通截止频率',
+        'gain': '增益 (dB)',
+        'filter_domain': '滤波实现方式',
+        'kernel_size': 'FIR 核大小',
+        'window': 'FIR 窗函数',
+        'echo_delay': '回声延迟 (ms)',
+        'echo_decay': '回声衰减系数',
+        'echo_feedback': '回声反馈',
+    }
+    value_labels = {
+        'freq': lambda v: f"{v:.1f} Hz" if v else '(未设置)',
+        'time': lambda v: f"{v:.1f} ms" if v else '(未设置)',
+        'domain': lambda v: '频域 FFT' if v == 'freq' else '时域 FIR' if v == 'time' else str(v),
+        'bool': lambda v: '开启' if v else '关闭',
+        'num': lambda v: f"{v:+.1f} dB" if v is not None else '(未设置)',
+        'size': lambda v: f"{v} 抽头" if v else '(自动)',
+        'any': lambda v: str(v) if v is not None else '(未设置)',
+    }
+    type_map = {
+        'highpass': 'freq', 'lowpass': 'freq', 'gain': 'num',
+        'filter_domain': 'domain', 'kernel_size': 'size', 'window': 'any',
+        'echo_delay': 'time', 'echo_decay': 'any', 'echo_feedback': 'bool',
+    }
+    displayed = set()
+    for key, label in key_labels.items():
+        if key in cfg:
+            t = type_map.get(key, 'any')
+            fmt = value_labels[t]
+            lines.append(f"  {label:20s}: {fmt(cfg[key])}")
+            displayed.add(key)
+    for key, val in cfg.items():
+        if key not in key_labels and key != 'description':
+            lines.append(f"  {key:20s}: {val}")
+    steps = []
+    if cfg.get('highpass') is not None:
+        steps.append(f"高通 {cfg['highpass']:.0f}Hz")
+    if cfg.get('lowpass') is not None:
+        steps.append(f"低通 {cfg['lowpass']:.0f}Hz")
+    if cfg.get('gain') is not None and cfg['gain'] != 0:
+        steps.append(f"增益 {cfg['gain']:+.1f}dB")
+    if cfg.get('echo_delay') is not None:
+        steps.append(f"回声 {cfg['echo_delay']:.0f}ms")
+    if steps:
+        lines.append("")
+        lines.append(f"处理流程: {' → '.join(steps)}")
+    return "\n".join(lines)
+
+
+def copy_preset(src_name, dst_name, custom_file, description=None, presets=None):
+    if presets is None:
+        presets = load_presets(custom_file)
+    if src_name not in presets:
+        raise ValueError(f"源预设 '{src_name}' 不存在")
+    src_cfg = dict(presets[src_name])
+    if description is not None:
+        src_cfg['description'] = description
+    save_preset(dst_name, src_cfg, custom_file)
+    return src_cfg
+
+
+def format_batch_summary(results, title="批量处理汇总", extra_cols=None):
+    if not results:
+        return "(无成功处理的文件)"
+    lines = ["", "-" * 72, f"  {title}", "-" * 72]
+    base_cols = [('文件名', 30, 'filename')]
+    if any('rms_in' in r for r in results):
+        base_cols.append(('输入RMS', 10, 'rms_in'))
+        base_cols.append(('输出RMS', 10, 'rms_out'))
+        base_cols.append(('变化(dB)', 10, 'rms_change_db'))
+    if any('dominant_in' in r for r in results):
+        base_cols.append(('原主导Hz', 12, 'dominant_in'))
+        base_cols.append(('新主导Hz', 12, 'dominant_out'))
+    if any('steps' in r for r in results):
+        base_cols.append(('处理步骤', 30, 'steps'))
+    if any('status' in r for r in results):
+        base_cols.append(('状态', 8, 'status'))
+    if extra_cols:
+        base_cols.extend(extra_cols)
+    header_parts = [f"{label:>{w}}" if i > 0 else f"{label:<{w}}" for i, (label, w, _) in enumerate(base_cols)]
+    lines.append("  " + " ".join(header_parts))
+    total_w = sum(w for _, w, _ in base_cols) + (len(base_cols) - 1)
+    lines.append("  " + "-" * total_w)
+    def fmt_val(v, width, align_left=False):
+        if v is None:
+            s = '-'
+        elif isinstance(v, float):
+            if abs(v) >= 1000:
+                s = f"{v:.0f}"
+            elif abs(v) >= 10:
+                s = f"{v:.2f}"
+            else:
+                s = f"{v:.4f}"
+        elif isinstance(v, bool):
+            s = '✓' if v else '✗'
+        else:
+            s = str(v)
+        if len(s) > width:
+            s = s[:width - 1] + '…'
+        if align_left:
+            return f"{s:<{width}}"
+        return f"{s:>{width}}"
+    for r in results:
+        row_parts = []
+        for i, (_, w, key) in enumerate(base_cols):
+            v = r.get(key, None)
+            row_parts.append(fmt_val(v, w, align_left=(i == 0)))
+        lines.append("  " + " ".join(row_parts))
+    lines.append("-" * 72)
+    return "\n".join(lines)
+
+
+def write_batch_manifest(file_path, results, extra_info=None):
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True) if os.path.dirname(file_path) else None
+    with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        if extra_info:
+            writer.writerow(['=== 处理信息 ==='])
+            for k, v in extra_info.items():
+                writer.writerow([k, v])
+            writer.writerow([])
+        writer.writerow(['=== 处理清单 ==='])
+        all_keys = set()
+        for r in results:
+            all_keys.update(r.keys())
+        ordered_keys = ['filename', 'input_path', 'output_path', 'status', 'steps',
+                        'rms_in', 'rms_out', 'rms_change_db',
+                        'dominant_in', 'dominant_out',
+                        'sample_rate', 'duration', 'channels',
+                        'peak_in', 'peak_out', 'error_msg']
+        header = [k for k in ordered_keys if k in all_keys]
+        for k in all_keys:
+            if k not in header:
+                header.append(k)
+        label_map = {
+            'filename': '文件名', 'input_path': '输入路径', 'output_path': '输出路径',
+            'status': '状态', 'steps': '处理步骤',
+            'rms_in': '输入RMS', 'rms_out': '输出RMS', 'rms_change_db': 'RMS变化(dB)',
+            'dominant_in': '原主导频率(Hz)', 'dominant_out': '新主导频率(Hz)',
+            'sample_rate': '采样率', 'duration': '时长(s)', 'channels': '声道数',
+            'peak_in': '输入峰值', 'peak_out': '输出峰值', 'error_msg': '错误信息',
+        }
+        writer.writerow([label_map.get(k, k) for k in header])
+        for r in results:
+            writer.writerow([r.get(k, '') for k in header])

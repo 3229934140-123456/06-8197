@@ -1,0 +1,9 @@
+{
+  "my-echo-room": {
+    "description": "我的房间回声定制",
+    "echo_delay": 250,
+    "echo_decay": 0.4,
+    "echo_feedback": true,
+    "gain": 0
+  }
+}
