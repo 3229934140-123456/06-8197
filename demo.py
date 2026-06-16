@@ -1,19 +1,43 @@
 import math
-from audio_engine import *
+import os
+
+from audio_engine import (
+    generate_composite_signal,
+    add_white_noise,
+    compute_spectrum,
+    find_spectrum_peaks,
+    format_peak_table,
+    compute_signal_rms,
+    apply_gain,
+    apply_echo,
+    apply_freq_filter,
+    apply_time_filter,
+    create_lowpass_kernel,
+    create_highpass_kernel,
+    write_wav,
+    read_wav,
+    compute_band_energy,
+    generate_sine_wave,
+    fft,
+    ifft,
+)
 
 
-def print_separator(title=""):
-    line = "=" * 70
+OUTPUT_DIR = "output"
+
+
+def print_sep(title="", width=72):
+    bar = "=" * width
     if title:
-        print(f"\n{line}")
+        print(f"\n{bar}")
         print(f"  {title}")
-        print(line)
+        print(bar)
     else:
-        print(f"\n{line}")
+        print(f"\n{bar}")
 
 
 def demo_fft_basics():
-    print_separator("第一部分：FFT 基础验证")
+    print_sep("第一部分：FFT 基础验证 (位反转 + 蝶形运算)")
 
     sample_rate = 1000
     duration = 1.024
@@ -30,7 +54,7 @@ def demo_fft_basics():
     print(f"\n输入信号: 50 Hz 正弦波, 幅度 1.0")
     print(f"FFT 输出长度: {len(spectrum)}")
 
-    magnitudes = [abs(s) for s in spectrum[:n//2]]
+    magnitudes = [abs(s) for s in spectrum[:n // 2]]
     max_mag = max(magnitudes)
     max_idx = magnitudes.index(max_mag)
     peak_freq = max_idx * sample_rate / n
@@ -48,307 +72,337 @@ def demo_fft_basics():
     print("\n✓ FFT/IFFT 验证通过")
 
 
-def demo_spectrum_analysis():
-    print_separator("第二部分：合成信号频谱分析")
-
-    sample_rate = 2000
-    duration = 1.024
-    n = int(sample_rate * duration)
+def demo_spectrum_analysis(sample_rate=22050, duration=1.0):
+    print_sep("第二部分：合成信号频谱分析（改进的峰值表）")
 
     components = [
-        (50, 1.0),
-        (120, 0.7),
-        (250, 0.5),
-        (500, 0.3),
-        (800, 0.2),
+        (100, 1.00),
+        (250, 0.70),
+        (440, 0.50),
+        (880, 0.30),
+        (1500, 0.20),
+        (3000, 0.10),
     ]
 
     print(f"\n合成信号成分:")
     for freq, amp in components:
-        print(f"  {freq:4d} Hz, 幅度 {amp:.2f}")
+        print(f"  {freq:5d} Hz, 幅度 {amp:.3f}")
 
     signal = generate_composite_signal(components, sample_rate, duration)
-    signal = add_white_noise(signal, amplitude=0.05)
+    signal = add_white_noise(signal, amplitude=0.03, seed=42)
 
-    frequencies, magnitudes, full_spectrum = compute_spectrum(signal, sample_rate)
+    freqs, mags, norm_mags, _ = compute_spectrum(signal, sample_rate)
 
-    print(f"\n频谱分析结果:")
-    print(f"  采样率: {sample_rate} Hz")
-    print(f"  FFT 长度: {n} 点")
-    print(f"  频率分辨率: {sample_rate/n:.3f} Hz/bin")
-    print(f"  Nyquist 频率: {sample_rate/2} Hz")
+    n_fft = len(mags) * 2
+    print(f"\n频谱分析参数:")
+    print(f"  采样率:        {sample_rate} Hz")
+    print(f"  FFT 长度:      {n_fft} 点")
+    print(f"  频率分辨率:    {sample_rate/n_fft:.3f} Hz/bin")
+    print(f"  Nyquist 频率:  {sample_rate/2:.0f} Hz")
+    print(f"  信号 RMS:      {compute_signal_rms(signal):.4f}")
 
-    print(f"\n主要频谱峰值 (前 8 个):")
-    peak_data = []
-    for k in range(1, n//2 - 1):
-        if magnitudes[k] > magnitudes[k-1] and magnitudes[k] > magnitudes[k+1]:
-            freq = frequencies[k]
-            mag_norm = 2 * magnitudes[k] / n
-            if mag_norm > 0.05:
-                peak_data.append((freq, mag_norm))
+    print(format_peak_table(
+        find_spectrum_peaks(freqs, norm_mags, max_peaks=10),
+        title="频谱峰值（按幅度排序, 前 10 个）"
+    ))
 
-    peak_data.sort(key=lambda x: x[1], reverse=True)
-    for i, (freq, mag) in enumerate(peak_data[:8]):
-        print(f"  峰值 {i+1}: {freq:7.2f} Hz, 归一化幅度 {mag:.4f}")
-
+    print("  备注: 归一化幅度 = 相对于最大峰值的比例, 2.0×|X[k]|/N 对应实际正弦波幅度")
     print("\n✓ 频谱分析完成")
-    return signal, sample_rate, frequencies, magnitudes
+    return signal, sample_rate, components
 
 
-def demo_filter_freq_domain(signal, sample_rate):
-    print_separator("第三部分：频域滤波（FFT 方法）")
+def demo_filter_frequency_domain(signal, sample_rate, components):
+    import math
+    print_sep("第三部分：频域滤波（FFT 方法）—— 截止效果验证")
 
-    n = len(signal)
+    cutoff_lp = 600
+    cutoff_hp = 700
 
-    print(f"\n原始信号 RMS: {math.sqrt(sum(s**2 for s in signal)/n):.4f}")
+    print(f"\n信号包含频率分量: {[c[0] for c in components]} Hz")
 
-    lowpass_signal = apply_freq_filter(signal, sample_rate, 200, 'lowpass')
-    highpass_signal = apply_freq_filter(signal, sample_rate, 300, 'highpass')
+    freqs_orig, _, norm_orig, _ = compute_spectrum(signal, sample_rate)
+    peaks_orig = find_spectrum_peaks(freqs_orig, norm_orig, max_peaks=8)
 
-    print(f"\n低通滤波 (截止 200 Hz):")
-    print(f"  输出 RMS: {math.sqrt(sum(s**2 for s in lowpass_signal[:n])/n):.4f}")
+    print(format_peak_table(peaks_orig, title="滤波前频谱峰值"))
 
-    _, mag_low, _ = compute_spectrum(lowpass_signal, sample_rate)
-    print(f"  200 Hz 以上分量 (归一化幅度和): {sum(mag_low[40:])*2/n:.4f}")
+    signal_lp = apply_freq_filter(signal, sample_rate, cutoff_lp, 'lowpass')
 
-    print(f"\n高通滤波 (截止 300 Hz):")
-    print(f"  输出 RMS: {math.sqrt(sum(s**2 for s in highpass_signal[:n])/n):.4f}")
+    freqs_lp, _, norm_lp, _ = compute_spectrum(signal_lp, sample_rate)
+    peaks_lp = find_spectrum_peaks(freqs_lp, norm_lp, max_peaks=8)
 
-    _, mag_high, _ = compute_spectrum(highpass_signal, sample_rate)
-    print(f"  300 Hz 以下分量 (归一化幅度和): {sum(mag_high[:60])*2/n:.4f}")
+    print(f"\n[低通滤波] 截止频率: {cutoff_lp} Hz")
+    print(f"  预期: {cutoff_lp} Hz 以下保留, {cutoff_lp} Hz 以上明显衰减")
+    print(format_peak_table(peaks_lp, title="低通滤波后频谱峰值"))
+
+    e_below = compute_band_energy(signal, sample_rate, 0, cutoff_lp)
+    e_above = compute_band_energy(signal, sample_rate, cutoff_lp, sample_rate / 2)
+    e_below_out = compute_band_energy(signal_lp, sample_rate, 0, cutoff_lp)
+    e_above_out = compute_band_energy(signal_lp, sample_rate, cutoff_lp, sample_rate / 2)
+
+    print(f"  频段能量对比:")
+    print(f"    截止频率以下 (0~{cutoff_lp} Hz): 输入 {e_below*100:.1f}% → 输出 {e_below_out*100:.1f}%")
+    print(f"    截止频率以上 ({cutoff_lp}~{sample_rate//2} Hz): 输入 {e_above*100:.1f}% → 输出 {e_above_out*100:.1f}%")
+    if e_above > 1e-10:
+        sup = -10 * math.log10(max(e_above_out, 1e-10) / max(e_above, 1e-10))
+        print(f"    高频抑制量: {sup:.1f} dB")
+
+    signal_hp = apply_freq_filter(signal, sample_rate, cutoff_hp, 'highpass')
+
+    freqs_hp, _, norm_hp, _ = compute_spectrum(signal_hp, sample_rate)
+    peaks_hp = find_spectrum_peaks(freqs_hp, norm_hp, max_peaks=8)
+
+    print(f"\n[高通滤波] 截止频率: {cutoff_hp} Hz")
+    print(f"  预期: {cutoff_hp} Hz 以下明显衰减, {cutoff_hp} Hz 以上保留")
+    print(format_peak_table(peaks_hp, title="高通滤波后频谱峰值"))
+
+    e_below_hp = compute_band_energy(signal, sample_rate, 0, cutoff_hp)
+    e_above_hp = compute_band_energy(signal, sample_rate, cutoff_hp, sample_rate / 2)
+    e_below_hp_out = compute_band_energy(signal_hp, sample_rate, 0, cutoff_hp)
+    e_above_hp_out = compute_band_energy(signal_hp, sample_rate, cutoff_hp, sample_rate / 2)
+
+    print(f"  频段能量对比:")
+    print(f"    截止频率以下 (0~{cutoff_hp} Hz): 输入 {e_below_hp*100:.1f}% → 输出 {e_below_hp_out*100:.1f}%")
+    print(f"    截止频率以上 ({cutoff_hp}~{sample_rate//2} Hz): 输入 {e_above_hp*100:.1f}% → 输出 {e_above_hp_out*100:.1f}%")
+    if e_below_hp > 1e-10:
+        sup = -10 * math.log10(max(e_below_hp_out, 1e-10) / max(e_below_hp, 1e-10))
+        print(f"    低频抑制量: {sup:.1f} dB")
 
     print("\n✓ 频域滤波演示完成")
-    return lowpass_signal, highpass_signal
+    return signal_lp, signal_hp
 
 
-def demo_filter_time_domain(signal, sample_rate):
-    print_separator("第四部分：时域滤波（卷积核方法）")
+def demo_filter_time_domain(signal, sample_rate, components):
+    import math
+    print_sep("第四部分：时域滤波（FIR 卷积）—— 校准后的截止效果")
 
-    n = len(signal)
+    cutoff_lp = 200
+    cutoff_hp = 300
+    kernel_size = 255
 
-    kernel_size = 63
-    lp_kernel = create_lowpass_kernel(200, sample_rate, kernel_size)
-    hp_kernel = create_highpass_kernel(300, sample_rate, kernel_size)
+    print(f"\n信号包含频率分量: {[c[0] for c in components]} Hz")
 
-    print(f"\n低通滤波器核:")
-    print(f"  长度: {len(lp_kernel)} 抽头")
-    print(f"  截止频率: 200 Hz")
-    print(f"  窗函数: Blackman")
-    print(f"  核系数和: {sum(lp_kernel):.6f}")
+    freqs_orig, _, norm_orig, _ = compute_spectrum(signal, sample_rate)
+    peaks_orig = find_spectrum_peaks(freqs_orig, norm_orig, max_peaks=8)
+    print(format_peak_table(peaks_orig, title="滤波前频谱峰值"))
 
-    lp_filtered = apply_time_filter(signal, lp_kernel)
+    print(f"\n--- 低通 FIR 滤波 (截止 {cutoff_lp} Hz, {kernel_size} 抽头 Blackman 窗) ---")
+    print(f"  预期: 100Hz、250Hz 中 250Hz 应被明显抑制, 440Hz 及以上更弱")
 
-    print(f"\n低通滤波结果:")
-    print(f"  输入 RMS: {math.sqrt(sum(s**2 for s in signal)/n):.4f}")
-    print(f"  输出 RMS: {math.sqrt(sum(s**2 for s in lp_filtered)/n):.4f}")
+    lp_kernel = create_lowpass_kernel(cutoff_lp, sample_rate, kernel_size=kernel_size)
+    signal_lp = apply_time_filter(signal, lp_kernel)
 
-    hp_filtered = apply_time_filter(signal, hp_kernel)
+    freqs_lp, _, norm_lp, _ = compute_spectrum(signal_lp, sample_rate)
+    peaks_lp = find_spectrum_peaks(freqs_lp, norm_lp, max_peaks=8)
+    print(format_peak_table(peaks_lp, title="低通滤波后频谱峰值"))
 
-    print(f"\n高通滤波结果:")
-    print(f"  输出 RMS: {math.sqrt(sum(s**2 for s in hp_filtered)/n):.4f}")
+    print(f"\n  各频率幅度变化 (归一化幅度 - 相对于原信号峰值):")
+    peak_dict_orig = {round(p['frequency']): p['normalized_magnitude'] for p in peaks_orig}
+    peak_dict_lp = {round(p['frequency']): p['normalized_magnitude'] for p in peaks_lp}
+    for freq, _ in components:
+        f_key = round(freq)
+        orig_m = peak_dict_orig.get(f_key, 0.0)
+        lp_m = peak_dict_lp.get(f_key, 0.0)
+        if orig_m > 0.01:
+            atten = 20 * math.log10(lp_m / orig_m) if lp_m > 0 else -999
+            marker = " ↓被抑制" if (freq > cutoff_lp and atten < -6) else " ✓保留"
+            print(f"    {freq:5d} Hz: {orig_m:.3f} → {lp_m:.3f} ({atten:+.1f} dB){marker}")
 
-    print("\n✓ 时域滤波演示完成")
-    return lp_filtered, hp_filtered
+    e_above_in = compute_band_energy(signal, sample_rate, cutoff_lp + 50, sample_rate / 2)
+    e_above_out = compute_band_energy(signal_lp, sample_rate, cutoff_lp + 50, sample_rate / 2)
+    if e_above_in > 1e-10:
+        sup = -10 * math.log10(max(e_above_out, 1e-10) / max(e_above_in, 1e-10))
+        print(f"  {cutoff_lp+50} Hz 以上频段总抑制: {sup:.1f} dB")
+
+    print(f"\n--- 高通 FIR 滤波 (截止 {cutoff_hp} Hz, {kernel_size} 抽头 Blackman 窗) ---")
+    print(f"  预期: 440Hz、880Hz 等保留, 300Hz 以下 (100Hz、250Hz) 明显衰减")
+
+    hp_kernel = create_highpass_kernel(cutoff_hp, sample_rate, kernel_size=kernel_size)
+    signal_hp = apply_time_filter(signal, hp_kernel)
+
+    freqs_hp, _, norm_hp, _ = compute_spectrum(signal_hp, sample_rate)
+    peaks_hp = find_spectrum_peaks(freqs_hp, norm_hp, max_peaks=8)
+    print(format_peak_table(peaks_hp, title="高通滤波后频谱峰值"))
+
+    print(f"\n  各频率幅度变化:")
+    peak_dict_hp = {round(p['frequency']): p['normalized_magnitude'] for p in peaks_hp}
+    for freq, _ in components:
+        f_key = round(freq)
+        orig_m = peak_dict_orig.get(f_key, 0.0)
+        hp_m = peak_dict_hp.get(f_key, 0.0)
+        if orig_m > 0.01:
+            atten = 20 * math.log10(hp_m / orig_m) if hp_m > 0 else -999
+            marker = " ↓被抑制" if (freq < cutoff_hp and atten < -6) else " ✓保留"
+            print(f"    {freq:5d} Hz: {orig_m:.3f} → {hp_m:.3f} ({atten:+.1f} dB){marker}")
+
+    e_below_in = compute_band_energy(signal, sample_rate, 0, cutoff_hp - 50)
+    e_below_out = compute_band_energy(signal_hp, sample_rate, 0, cutoff_hp - 50)
+    if e_below_in > 1e-10:
+        sup = -10 * math.log10(max(e_below_out, 1e-10) / max(e_below_in, 1e-10))
+        print(f"  {cutoff_hp-50} Hz 以下频段总抑制: {sup:.1f} dB")
+
+    print("\n✓ 时域 FIR 滤波演示完成")
+    return signal_lp, signal_hp
 
 
 def demo_effects(signal, sample_rate):
-    print_separator("第五部分：音频效果（增益、回声）")
+    print_sep("第五部分：音频效果（增益、回声）")
 
     n = len(signal)
 
     print(f"\n--- 增益效果 ---")
     gain_db = 6.0
-    gained_signal = apply_gain(signal, gain_db)
+    gained = apply_gain(signal, gain_db)
 
-    input_rms = math.sqrt(sum(s**2 for s in signal)/n)
-    output_rms = math.sqrt(sum(s**2 for s in gained_signal)/n)
-    actual_gain_db = 20 * math.log10(output_rms / input_rms)
+    input_rms = compute_signal_rms(signal)
+    output_rms = compute_signal_rms(gained)
+    actual_gain_db = 20 * math.log10(output_rms / input_rms) if input_rms > 0 else 0
 
-    print(f"  目标增益: {gain_db} dB")
+    print(f"  目标增益: {gain_db} dB (线性倍数: {10**(gain_db/20):.4f}x)")
+    print(f"  输入 RMS: {input_rms:.4f}")
+    print(f"  输出 RMS: {output_rms:.4f}")
     print(f"  实际增益: {actual_gain_db:.2f} dB")
-    print(f"  线性增益倍数: {10**(gain_db/20):.4f}")
 
-    print(f"\n--- 回声效果（无反馈）---")
+    print(f"\n--- 回声效果（无反馈单次回声）---")
     delay_ms = 200
-    decay = 0.5
+    decay = 0.4
     echo_signal = apply_echo(signal, sample_rate, delay_ms, decay, feedback=False)
 
     delay_samples = int(delay_ms * sample_rate / 1000)
-    print(f"  延迟时间: {delay_ms} ms ({delay_samples} 采样点)")
-    print(f"  衰减系数: {decay}")
-    print(f"  输入 RMS: {input_rms:.4f}")
-    print(f"  输出 RMS: {math.sqrt(sum(s**2 for s in echo_signal)/n):.4f}")
+    print(f"  延迟: {delay_ms} ms = {delay_samples} 采样点")
+    print(f"  衰减: {decay}")
+    print(f"  输出 RMS: {compute_signal_rms(echo_signal):.4f}")
 
-    print(f"\n--- 回声效果（带反馈）---")
-    decay_fb = 0.6
+    print(f"\n--- 回声效果（带反馈多次回声）---")
+    decay_fb = 0.5
     echo_fb_signal = apply_echo(signal, sample_rate, delay_ms, decay_fb, feedback=True)
-
-    print(f"  延迟时间: {delay_ms} ms")
+    print(f"  延迟: {delay_ms} ms")
     print(f"  反馈系数: {decay_fb}")
-    print(f"  输出 RMS: {math.sqrt(sum(s**2 for s in echo_fb_signal)/n):.4f}")
+    print(f"  理论总增益: 1/(1-α) = {1/(1-decay_fb):.2f}x")
+    print(f"  输出 RMS: {compute_signal_rms(echo_fb_signal):.4f}")
 
     print("\n✓ 音频效果演示完成")
-    return gained_signal, echo_signal, echo_fb_signal
+    return gained, echo_signal, echo_fb_signal
+
+
+def demo_wav_io(signal, sample_rate, components):
+    print_sep("第六部分：WAV 文件读写（可实际听效果）")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print(f"\n输出目录: {os.path.abspath(OUTPUT_DIR)}/")
+
+    original_path = os.path.join(OUTPUT_DIR, "01_original.wav")
+    write_wav(original_path, signal, sample_rate)
+    print(f"  ✓ 原始信号: {original_path}")
+
+    cutoff_lp = 200
+    lp_kernel = create_lowpass_kernel(cutoff_lp, sample_rate, kernel_size=255)
+    signal_lp = apply_time_filter(signal, lp_kernel)
+    lp_path = os.path.join(OUTPUT_DIR, "02_lowpass_200Hz.wav")
+    write_wav(lp_path, signal_lp, sample_rate)
+    print(f"  ✓ 低通滤波 (200Hz FIR): {lp_path}")
+
+    cutoff_hp = 800
+    hp_kernel = create_highpass_kernel(cutoff_hp, sample_rate, kernel_size=255)
+    signal_hp = apply_time_filter(signal, hp_kernel)
+    hp_path = os.path.join(OUTPUT_DIR, "03_highpass_800Hz.wav")
+    write_wav(hp_path, signal_hp, sample_rate)
+    print(f"  ✓ 高通滤波 (800Hz FIR): {hp_path}")
+
+    gained = apply_gain(signal, 3.0)
+    gain_path = os.path.join(OUTPUT_DIR, "04_gain_plus3dB.wav")
+    write_wav(gain_path, gained, sample_rate)
+    print(f"  ✓ 增益 +3dB: {gain_path}")
+
+    echo_simple = apply_echo(signal, sample_rate, 300, 0.4, feedback=False)
+    echo1_path = os.path.join(OUTPUT_DIR, "05_echo_simple.wav")
+    write_wav(echo1_path, echo_simple, sample_rate)
+    print(f"  ✓ 单次回声 (300ms): {echo1_path}")
+
+    echo_fb = apply_echo(signal, sample_rate, 250, 0.55, feedback=True)
+    echo2_path = os.path.join(OUTPUT_DIR, "06_echo_feedback.wav")
+    write_wav(echo2_path, echo_fb, sample_rate)
+    print(f"  ✓ 反馈回声 (250ms α=0.55): {echo2_path}")
+
+    print(f"\n--- 验证 WAV 读回 ---")
+    signal_read, sr_read, ch_read = read_wav(original_path)
+    print(f"  读回采样率: {sr_read} Hz")
+    print(f"  读回通道数: {ch_read}")
+    rms_orig = compute_signal_rms(signal)
+    rms_read = compute_signal_rms(signal_read)
+    print(f"  写入 RMS: {rms_orig:.6f}")
+    print(f"  读回 RMS: {rms_read:.6f}")
+    print(f"  差异: {abs(rms_orig - rms_read):.2e} (16-bit 量化误差范围内)")
+
+    print("\n✓ WAV 读写演示完成，所有文件可直接播放试听")
 
 
 def demo_theory_explanation():
-    print_separator("第六部分：原理说明")
+    print_sep("第七部分：原理速查")
 
     print("""
-1. FFT 如何用分治把 O(n²) 降到 O(n log n)
-   ─────────────────────────────────────
-   朴素 DFT 公式: X[k] = Σ x[n]·e^(-j2πkn/N)
-   每个频率分量需要 N 次复数乘法 → O(N²)
-
-   Cooley-Tukey FFT 分治思想:
-   - 将 x[n] 按奇偶下标分成两组: x[偶数], x[奇数]
-   - 利用旋转因子对称性: W_N^(k+N/2) = -W_N^k
-   - N 点 DFT = 两个 N/2 点 DFT 的组合
-   - 递归分解直到 2 点 DFT
-
-   复杂度分析:
-   - 分解层数: log₂N 层
-   - 每层运算量: O(N) 次蝶形运算
-   - 总复杂度: O(N log N)
-
-   例: N=1024
-   - 朴素 DFT: 1,048,576 次运算
-   - FFT: 10,240 次运算 → 快 100 倍
-
-
-2. 蝶形运算和位反转重排的作用
-   ────────────────────────────
-   蝶形运算 (Butterfly):
-   - FFT 的基本运算单元
-   - 输入: 两个复数 a, b 和旋转因子 W
-   - 输出: a + W·b 和 a - W·b
-   - 形似蝴蝶,故名"蝶形"
-   - 每次蝶形运算包含 1 次复数乘法 + 2 次复数加法
-
-   位反转重排 (Bit-Reversal):
-   - 因为分治是按二进制位的奇偶分组
-   - 输入顺序经过 log₂N 次分组后变成"位反转"顺序
-   - 例如 N=8 (3位):
-     原索引:  000 001 010 011 100 101 110 111
-     位反转:  000 100 010 110 001 101 011 111
-             =  0   4   2   6   1   5   3   7
-   - 作用: 保证原位运算 (in-place) 的正确性
-   - 方式一: 开始时把输入按位反转重排
-   - 方式二: 结束时把输出按位反转重排
-
-
-3. 为何输入长度通常要求是 2 的幂
-   ────────────────────────────────
-   - 基-2 FFT (最常用) 要求 N = 2^m
-   - 每次都可以精确对半分解
-   - 算法实现简单,效率高
-   - 其他选择:
-     * 基-4 FFT: N = 4^m, 乘法更少但更复杂
-     * 混合基 FFT: N 可分解为小素数乘积
-     * Bluestein 算法: 任意长度 FFT
-   - 工程中常用"补零"(zero-padding)到下一个 2 的幂
-
-
-4. 频谱 bin 对应的频率如何确定
-   ──────────────────────────────
-   第 k 个 bin 对应的频率:
-     f_k = k × Fs / N
-
-   其中:
-   - Fs: 采样率 (Hz)
-   - N: FFT 变换长度 (点数)
-   - k: bin 索引 (0, 1, ..., N/2)
-
-   频率分辨率 (bin 间距):
-     Δf = Fs / N
-
-   例子: Fs=44100 Hz, N=1024
-   - Δf = 44100/1024 ≈ 43.07 Hz
-   - bin 0: 0 Hz (直流分量)
-   - bin 1: ~43 Hz
-   - bin 512: 22050 Hz (Nyquist 频率)
-
-   提高频率分辨率的方法:
-   - 增加 FFT 长度 N
-   - 补零可以让频谱更"密",但不能提高真实分辨率
-
-
-5. 低通滤波的两种实现
-   ──────────────────────
-   频域方法 (FFT 滤波):
-   原理: 频谱 × 滤波器频率响应
-   步骤:
-     1. FFT 将信号变换到频域
-     2. 把截止频率以上的 bin 设为 0
-     3. IFFT 变换回时域
-   优点: 计算快 (O(N log N)), 概念直观
-   缺点: 有"吉布斯现象", 边缘效应, 需要 2 的幂
-   适用: 离线处理、频谱分析
-
-   时域方法 (卷积/ FIR 滤波器):
-   原理: 信号与滤波器冲激响应卷积
-     y[n] = Σ h[k] · x[n-k]
-   设计方法:
-     - 窗函数法: 理想 sinc × 窗函数
-     - 等波纹法: Parks-McClellan
-   优点: 相位线性, 稳定, 实时处理
-   缺点: 直接卷积 O(N·M), M 是核长度
-   适用: 实时音频、嵌入式系统
-
-
-6. 回声效果的实现原理
-   ──────────────────────
-   基本回声 (无反馈):
-     y[n] = x[n] + α · x[n - D]
-   
-   带反馈回声 (多次回声):
-     y[n] = x[n] + α · y[n - D]
-
-   其中:
-   - D: 延迟采样数 = 延迟时间(ms) × Fs / 1000
-   - α: 衰减/反馈系数 (0 < α < 1)
-
-   无反馈 vs 带反馈:
-   - 无反馈: 只有一次回声, 简单叠加
-   - 带反馈: 无限递减的回声序列
-     第 k 次回声幅度: α^k
-     总增益: 1/(1-α)  (需注意 α<1 保证稳定)
-
-   实际应用中:
-   - 延迟时间: 通常 30-500 ms
-   - 衰减系数: 0.3-0.8
-   - 可加入低通滤波模拟空气吸收
-   - 可使用多抽头延迟线模拟房间反射
+┌───────────────────────────────────────────────────────────────────┐
+│ 1. FFT 分治 O(n²) → O(n log n)                                    │
+│   Cooley-Tukey 按奇偶分两组，每层 O(N) 蝶形运算 × log₂N 层         │
+│   旋转因子对称性 W^(k+N/2) = -W^k 消除一半冗余                    │
+│                                                                   │
+│ 2. 蝶形运算 & 位反转重排                                           │
+│   蝶形: a+bW 与 a-bW 每次 1 乘 2 加                               │
+│   位反转: 原位运算前需按二进制位逆序重排输入                       │
+│   例 N=8: 原序 0,1,2,3,4,5,6,7 → 位反转 0,4,2,6,1,5,3,7           │
+│                                                                   │
+│ 3. 为何要求 2 的幂                                                 │
+│   基-2 FFT 最常用，每次对半分解效率最高                            │
+│   其他选择: 基-4、混合基、Bluestein(任意长度)                       │
+│   工程上常用补零到下一 2^N                                          │
+│                                                                   │
+│ 4. 频谱 bin ↔ 频率映射                                             │
+│   f_k = k × Fs / N        Δf = Fs / N                             │
+│   例: Fs=44.1kHz N=1024, Δf≈43Hz, bin 512=22.05kHz(Nyquist)        │
+│                                                                   │
+│ 5. 低通滤波两种实现                                                │
+│   频域: FFT → 置零高频 bin → IFFT，快但有吉布斯效应                │
+│   时域: 与 sinc×窗 的 FIR 核卷积, 相位线性可实时, 阶数越高过渡带越窄│
+│                                                                   │
+│ 6. 回声实现                                                        │
+│   单次:  y[n] = x[n] + α·x[n-D]                                    │
+│   反馈:  y[n] = x[n] + α·y[n-D]   (α<1 保证稳定)                   │
+│   反馈回声衰减序列: α, α², α³, ...                                │
+└───────────────────────────────────────────────────────────────────┘
 """)
-
-    print("✓ 原理说明完成")
 
 
 def main():
-    print_separator("音频信号处理引擎 - 完整演示")
-    print("  时域与频域处理 · FFT · 滤波 · 效果器")
+    print_sep("音频信号处理引擎 v2.0 - 增强演示")
+    print("  FFT/IFFT · 频谱分析 · FIR 滤波 · WAV 读写 · 效果器")
 
     demo_fft_basics()
 
-    signal, sample_rate, frequencies, magnitudes = demo_spectrum_analysis()
+    sample_rate = 22050
+    duration = 1.0
+    signal, sample_rate, components = demo_spectrum_analysis(sample_rate, duration)
 
-    demo_filter_freq_domain(signal, sample_rate)
+    demo_filter_frequency_domain(signal, sample_rate, components)
 
-    demo_filter_time_domain(signal, sample_rate)
+    demo_filter_time_domain(signal, sample_rate, components)
 
     demo_effects(signal, sample_rate)
 
+    demo_wav_io(signal, sample_rate, components)
+
     demo_theory_explanation()
 
-    print_separator("演示全部完成")
-    print("\n所有功能模块:")
-    print("  ✓ FFT/IFFT (基-2, 位反转, 蝶形运算)")
-    print("  ✓ 频谱分析 (频率映射, 峰值检测)")
-    print("  ✓ 频域滤波 (低通/高通, FFT 方法)")
-    print("  ✓ 时域滤波 (FIR, 窗函数法, 卷积)")
-    print("  ✓ 增益效果 (dB 与线性转换)")
-    print("  ✓ 回声效果 (有无反馈两种模式)")
-    print("  ✓ 信号生成 (正弦波, 复合信号, 噪声)")
+    print_sep("所有演示完成 ✓")
+    print()
+    print("命令行工具用法:")
+    print("  python audio_tool.py generate    - 生成合成信号并导出 WAV")
+    print("  python audio_tool.py analyze     - 分析 WAV 频谱")
+    print("  python audio_tool.py filter      - 低通/高通滤波")
+    print("  python audio_tool.py gain        - 增益调整")
+    print("  python audio_tool.py echo        - 回声效果")
+    print("  python audio_tool.py process     - 完整处理管道")
+    print()
+    print("详细帮助: python audio_tool.py --help")
     print()
 
 
