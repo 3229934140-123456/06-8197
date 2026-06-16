@@ -1,0 +1,11 @@
+﻿=== 处理信息 ===
+任务类型,响度整理
+模式,峰值归一化→0.9000
+输入目录,output\batch_in
+输出目录,output\norm_peak
+
+=== 处理清单 ===
+文件名,输入路径,输出路径,状态,处理步骤,输入RMS,输出RMS,RMS变化(dB),原主导频率(Hz),新主导频率(Hz),采样率,时长(s),声道数,输入峰值,输出峰值,limited_count,clipped,adjusted_db,relative_path
+tone_a.wav,D:\trae-bz\TraeProjects\8197\output\batch_in\tone_a.wav,D:\trae-bz\TraeProjects\8197\output\norm_peak\tone_a.wav,成功,响度整理(峰值归一化→0.9000),0.5014684472344134,0.4750997902557033,-0.46917546793286624,100.26,100.26,22050,1.0,1,0.949951171875,0.9,0,False,-0.47,tone_a.wav
+tone_b.wav,D:\trae-bz\TraeProjects\8197\output\batch_in\tone_b.wav,D:\trae-bz\TraeProjects\8197\output\norm_peak\tone_b.wav,成功,响度整理(峰值归一化→0.9000),0.4999492465483641,0.4736604735224594,-0.46917546793286624,250.32,250.32,22050,1.0,1,0.949951171875,0.9,0,False,-0.47,tone_b.wav
+tone_c.wav,D:\trae-bz\TraeProjects\8197\output\batch_in\tone_c.wav,D:\trae-bz\TraeProjects\8197\output\norm_peak\tone_c.wav,成功,响度整理(峰值归一化→0.9000),0.5396447380961708,0.5112686616596567,-0.46917546793286624,440.08,440.08,22050,1.0,1,0.949951171875,0.9,0,False,-0.47,tone_c.wav

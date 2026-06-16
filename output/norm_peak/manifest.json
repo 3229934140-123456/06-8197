@@ -1,0 +1,78 @@
+{
+  "process_info": {
+    "任务类型": "响度整理",
+    "模式": "峰值归一化→0.9000",
+    "输入目录": "output\\batch_in",
+    "输出目录": "output\\norm_peak"
+  },
+  "files": [
+    {
+      "filename": "tone_a.wav",
+      "relative_path": "tone_a.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\batch_in\\tone_a.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\norm_peak\\tone_a.wav",
+      "steps": "响度整理(峰值归一化→0.9000)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.501468,
+      "rms_out": 0.4751,
+      "rms_change_db": -0.469175,
+      "peak_in": 0.949951,
+      "peak_out": 0.9,
+      "dominant_in": 100.26,
+      "dominant_out": 100.26,
+      "adjusted_db": -0.47,
+      "clipped": false,
+      "limited_count": 0
+    },
+    {
+      "filename": "tone_b.wav",
+      "relative_path": "tone_b.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\batch_in\\tone_b.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\norm_peak\\tone_b.wav",
+      "steps": "响度整理(峰值归一化→0.9000)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.499949,
+      "rms_out": 0.47366,
+      "rms_change_db": -0.469175,
+      "peak_in": 0.949951,
+      "peak_out": 0.9,
+      "dominant_in": 250.32,
+      "dominant_out": 250.32,
+      "adjusted_db": -0.47,
+      "clipped": false,
+      "limited_count": 0
+    },
+    {
+      "filename": "tone_c.wav",
+      "relative_path": "tone_c.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\batch_in\\tone_c.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\norm_peak\\tone_c.wav",
+      "steps": "响度整理(峰值归一化→0.9000)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.539645,
+      "rms_out": 0.511269,
+      "rms_change_db": -0.469175,
+      "peak_in": 0.949951,
+      "peak_out": 0.9,
+      "dominant_in": 440.08,
+      "dominant_out": 440.08,
+      "adjusted_db": -0.47,
+      "clipped": false,
+      "limited_count": 0
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "success": 3,
+    "failed": 0
+  }
+}

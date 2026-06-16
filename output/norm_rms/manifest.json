@@ -1,0 +1,78 @@
+{
+  "process_info": {
+    "任务类型": "响度整理",
+    "模式": "RMS归一化→0.1000",
+    "输入目录": "output\\recur_in",
+    "输出目录": "output\\norm_rms"
+  },
+  "files": [
+    {
+      "filename": "root.wav",
+      "relative_path": "root.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_in\\root.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\norm_rms\\root.wav",
+      "steps": "响度整理(RMS归一化→0.1000)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.671718,
+      "rms_out": 0.1,
+      "rms_change_db": -16.543736,
+      "peak_in": 0.949951,
+      "peak_out": 0.141421,
+      "dominant_in": 440.08,
+      "dominant_out": 440.08,
+      "adjusted_db": -16.54,
+      "clipped": false,
+      "limited_count": 0
+    },
+    {
+      "filename": "bass.wav",
+      "relative_path": "低频\\bass.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_in\\低频\\bass.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\norm_rms\\低频\\bass.wav",
+      "steps": "响度整理(RMS归一化→0.1000)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.513407,
+      "rms_out": 0.1,
+      "rms_change_db": -14.209235,
+      "peak_in": 0.949951,
+      "peak_out": 0.185029,
+      "dominant_in": 100.26,
+      "dominant_out": 100.26,
+      "adjusted_db": -14.21,
+      "clipped": false,
+      "limited_count": 0
+    },
+    {
+      "filename": "treble.wav",
+      "relative_path": "高频\\treble.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_in\\高频\\treble.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\norm_rms\\高频\\treble.wav",
+      "steps": "响度整理(RMS归一化→0.1000)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.547846,
+      "rms_out": 0.1,
+      "rms_change_db": -14.773173,
+      "peak_in": 0.949951,
+      "peak_out": 0.173397,
+      "dominant_in": 999.95,
+      "dominant_out": 999.95,
+      "adjusted_db": -14.77,
+      "clipped": false,
+      "limited_count": 0
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "success": 3,
+    "failed": 0
+  }
+}

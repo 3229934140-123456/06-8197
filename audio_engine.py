@@ -412,6 +412,51 @@ def apply_echo(signal, sample_rate, delay_ms, decay, feedback=False):
     return result
 
 
+def normalize_to_rms(signal, target_rms):
+    current_rms = compute_signal_rms(signal)
+    if current_rms < 1e-10:
+        return list(signal), 0.0, False
+    gain_db = 20 * math.log10(target_rms / current_rms)
+    gained = apply_gain(signal, gain_db)
+    peak = compute_signal_peak(gained)
+    clipped = peak > 1.0
+    if clipped:
+        scale = 0.99 / peak
+        gained = [s * scale for s in gained]
+        actual_gain_db = 20 * math.log10(scale) + gain_db
+    else:
+        actual_gain_db = gain_db
+    return gained, actual_gain_db, clipped
+
+
+def normalize_to_peak(signal, target_peak=0.95):
+    current_peak = compute_signal_peak(signal)
+    if current_peak < 1e-10:
+        return list(signal), 0.0
+    gain_db = 20 * math.log10(target_peak / current_peak)
+    gained = apply_gain(signal, gain_db)
+    return gained, gain_db
+
+
+def apply_limiter(signal, threshold=0.95, release_samples=1000):
+    n = len(signal)
+    result = [0.0] * n
+    gain = 1.0
+    limited_count = 0
+
+    for i in range(n):
+        if abs(signal[i]) > threshold:
+            needed_gain = threshold / abs(signal[i])
+            gain = needed_gain
+            limited_count += 1
+        else:
+            if gain < 1.0:
+                gain = min(1.0, gain + (1.0 - gain) / max(1, release_samples))
+        result[i] = signal[i] * gain
+
+    return result, limited_count
+
+
 def generate_sine_wave(freq, sample_rate, duration, amplitude=1.0):
     n = int(sample_rate * duration)
     signal = []
@@ -610,13 +655,20 @@ def export_spectrum_csv(file_path, analysis_info, signal=None, sample_rate=None,
                                 f"{mags[i]:.6f}", f"{norm_mags[i]:.6f}"])
 
 
-def find_wav_files(directory):
+def find_wav_files(directory, recursive=False):
     if not os.path.isdir(directory):
         return []
     wav_files = []
-    for f in sorted(os.listdir(directory)):
-        if f.lower().endswith('.wav'):
-            wav_files.append(os.path.join(directory, f))
+    if recursive:
+        for root, dirs, files in os.walk(directory):
+            dirs.sort()
+            for f in sorted(files):
+                if f.lower().endswith('.wav'):
+                    wav_files.append(os.path.join(root, f))
+    else:
+        for f in sorted(os.listdir(directory)):
+            if f.lower().endswith('.wav'):
+                wav_files.append(os.path.join(directory, f))
     return wav_files
 
 
@@ -876,3 +928,32 @@ def write_batch_manifest(file_path, results, extra_info=None):
         writer.writerow([label_map.get(k, k) for k in header])
         for r in results:
             writer.writerow([r.get(k, '') for k in header])
+
+
+def write_batch_manifest_json(file_path, results, extra_info=None):
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True) if os.path.dirname(file_path) else None
+    manifest = {}
+    if extra_info:
+        manifest['process_info'] = extra_info
+    file_entries = []
+    for r in results:
+        entry = {}
+        for k, v in r.items():
+            if isinstance(v, float):
+                if math.isinf(v) or math.isnan(v):
+                    entry[k] = None
+                else:
+                    entry[k] = round(v, 6)
+            elif isinstance(v, bool):
+                entry[k] = v
+            else:
+                entry[k] = v
+        file_entries.append(entry)
+    manifest['files'] = file_entries
+    manifest['summary'] = {
+        'total': len(results),
+        'success': sum(1 for r in results if r.get('status') in ('成功', 'OK')),
+        'failed': sum(1 for r in results if r.get('status') not in ('成功', 'OK')),
+    }
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)

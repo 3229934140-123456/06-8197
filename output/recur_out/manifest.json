@@ -1,0 +1,70 @@
+{
+  "process_info": {
+    "任务类型": "低通滤波",
+    "截止频率(Hz)": 500.0,
+    "实现方式": "time",
+    "输入目录": "output\\recur_in",
+    "输出目录": "output\\recur_out"
+  },
+  "files": [
+    {
+      "filename": "root.wav",
+      "relative_path": "root.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_in\\root.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_out\\root.wav",
+      "steps": "低通500Hz(511抽头)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.671718,
+      "rms_out": 0.627851,
+      "rms_change_db": -0.586611,
+      "peak_in": 0.949951,
+      "peak_out": 0.888567,
+      "dominant_in": 440.08,
+      "dominant_out": 440.08
+    },
+    {
+      "filename": "bass.wav",
+      "relative_path": "低频\\bass.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_in\\低频\\bass.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_out\\低频\\bass.wav",
+      "steps": "低通500Hz(511抽头)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.513407,
+      "rms_out": 0.513395,
+      "rms_change_db": -0.000207,
+      "peak_in": 0.949951,
+      "peak_out": 0.950093,
+      "dominant_in": 100.26,
+      "dominant_out": 100.26
+    },
+    {
+      "filename": "treble.wav",
+      "relative_path": "高频\\treble.wav",
+      "input_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_in\\高频\\treble.wav",
+      "output_path": "D:\\trae-bz\\TraeProjects\\8197\\output\\recur_out\\高频\\treble.wav",
+      "steps": "低通500Hz(511抽头)",
+      "status": "成功",
+      "sample_rate": 22050,
+      "duration": 1.0,
+      "channels": 1,
+      "rms_in": 0.547846,
+      "rms_out": 0.004178,
+      "rms_change_db": -42.352793,
+      "peak_in": 0.949951,
+      "peak_out": 0.136066,
+      "dominant_in": 999.95,
+      "dominant_out": 481.81
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "success": 3,
+    "failed": 0
+  }
+}

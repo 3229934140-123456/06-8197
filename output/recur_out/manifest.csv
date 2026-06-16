@@ -1,0 +1,12 @@
+﻿=== 处理信息 ===
+任务类型,低通滤波
+截止频率(Hz),500.0
+实现方式,time
+输入目录,output\recur_in
+输出目录,output\recur_out
+
+=== 处理清单 ===
+文件名,输入路径,输出路径,状态,处理步骤,输入RMS,输出RMS,RMS变化(dB),原主导频率(Hz),新主导频率(Hz),采样率,时长(s),声道数,输入峰值,输出峰值,relative_path
+root.wav,D:\trae-bz\TraeProjects\8197\output\recur_in\root.wav,D:\trae-bz\TraeProjects\8197\output\recur_out\root.wav,成功,低通500Hz(511抽头),0.6717177202607081,0.6278505239213598,-0.5866108873857668,440.08,440.08,22050,1.0,1,0.949951171875,0.8885665716854206,root.wav
+bass.wav,D:\trae-bz\TraeProjects\8197\output\recur_in\低频\bass.wav,D:\trae-bz\TraeProjects\8197\output\recur_out\低频\bass.wav,成功,低通500Hz(511抽头),0.5134069793251546,0.5133947208546445,-0.0002073929600390013,100.26,100.26,22050,1.0,1,0.949951171875,0.9500930372208215,低频\bass.wav
+treble.wav,D:\trae-bz\TraeProjects\8197\output\recur_in\高频\treble.wav,D:\trae-bz\TraeProjects\8197\output\recur_out\高频\treble.wav,成功,低通500Hz(511抽头),0.5478462129453887,0.0041784864420645286,-42.352793330621104,999.95,481.81,22050,1.0,1,0.949951171875,0.13606643388414102,高频\treble.wav

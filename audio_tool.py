@@ -34,6 +34,10 @@ from audio_engine import (
     copy_preset,
     format_batch_summary,
     write_batch_manifest,
+    write_batch_manifest_json,
+    normalize_to_rms,
+    normalize_to_peak,
+    apply_limiter,
 )
 
 
@@ -77,11 +81,22 @@ def apply_preset_to_args(args, preset_name, presets, overwrite=False):
         if not hasattr(args, key):
             continue
         current = getattr(args, key)
+
         if overwrite:
-            if current is None or (isinstance(current, (int, float)) and (key == 'gain' and current == 0)):
-                setattr(args, key, value)
-                applied_keys.append(key)
-            elif key in ('echo_decay', 'filter_domain', 'window'):
+            should_set = False
+            if key in ('echo_feedback',):
+                should_set = True
+            elif key in ('echo_delay', 'highpass', 'lowpass', 'kernel_size'):
+                should_set = (current is None)
+            elif key in ('gain',):
+                should_set = (current == 0)
+            elif key in ('echo_decay',):
+                should_set = True
+            elif key in ('filter_domain', 'window'):
+                should_set = True
+            else:
+                should_set = (current is None)
+            if should_set:
                 setattr(args, key, value)
                 applied_keys.append(key)
         else:
@@ -89,6 +104,8 @@ def apply_preset_to_args(args, preset_name, presets, overwrite=False):
             if key == 'gain' and current == 0:
                 is_default = True
             if key == 'echo_decay' and current == 0.5:
+                is_default = True
+            if key == 'echo_feedback' and current == False:
                 is_default = True
             if key == 'filter_domain' and current == 'time':
                 is_default = True
@@ -126,7 +143,7 @@ def describe_process_steps(args):
     return steps
 
 
-def print_dry_run_plan(wav_files, output_dir, steps_str, naming_pattern="{fname}"):
+def print_dry_run_plan(wav_files, output_dir, steps_str, args=None, op_type=None):
     print()
     print_sep("-")
     print("  Dry-Run 执行计划 (不实际写文件)")
@@ -134,15 +151,24 @@ def print_dry_run_plan(wav_files, output_dir, steps_str, naming_pattern="{fname}
     print(f"  处理文件数: {len(wav_files)}")
     print(f"  输出目录:   {output_dir}")
     print(f"  处理步骤:   {steps_str if steps_str else '(无处理)'}")
-    print(f"  命名模式:   {naming_pattern}")
+    preserve = getattr(args, 'preserve_name', True) if args else True
+    print(f"  命名模式:   {'保留原文件名' if preserve else '加处理类型前缀'}")
     print()
-    print(f"  {'#':>3}  {'原文件名':<30}  ->  输出文件名")
-    print(f"  {'-':>3}  {'-':-<30}      {'-':-<30}")
+    print(f"  {'#':>3}  {'相对路径':<35}  ->  {'输出路径':<35}")
+    print(f"  {'-':>3}  {'-':-<35}      {'-':-<35}")
+    input_dir = getattr(args, '_input_dir', None) if args else None
     for i, fp in enumerate(wav_files, 1):
+        if input_dir:
+            rel = os.path.relpath(fp, input_dir)
+        else:
+            rel = os.path.basename(fp)
         fname = os.path.basename(fp)
-        base, ext = os.path.splitext(fname)
-        out_name = naming_pattern.format(fname=fname, base=base, ext=ext, ext_no_dot=ext[1:])
-        print(f"  {i:>3}  {fname:<30}  ->  {out_name}")
+        out_name = build_output_filename(fname, args, op_type=op_type)
+        if input_dir:
+            out_rel = os.path.join(os.path.dirname(rel), out_name) if os.path.dirname(rel) else out_name
+        else:
+            out_rel = out_name
+        print(f"  {i:>3}  {rel:<35}  ->  {out_rel}")
     print()
     print("  如需执行，请移除 --dry-run 参数")
     print_sep("-")
@@ -175,18 +201,23 @@ def build_output_filename(fname, args, op_type=None):
     return fname
 
 
-def finalize_batch_results(results, output_dir, extra_info=None, manifest_name='manifest.csv'):
+def finalize_batch_results(results, output_dir, extra_info=None, manifest_name='manifest', dry_run=False):
     print(format_batch_summary(results))
+    if dry_run:
+        print("\n  [Dry-Run] 不写入清单文件")
+        return
     os.makedirs(output_dir, exist_ok=True)
-    manifest_path = os.path.join(output_dir, manifest_name)
+    csv_path = os.path.join(output_dir, manifest_name + '.csv')
+    json_path = os.path.join(output_dir, manifest_name + '.json')
     try:
-        write_batch_manifest(manifest_path, results, extra_info=extra_info)
-        print(f"\n处理清单已保存到: {manifest_path}")
+        write_batch_manifest(csv_path, results, extra_info=extra_info)
+        write_batch_manifest_json(json_path, results, extra_info=extra_info)
+        print(f"\n处理清单已保存: {csv_path} / {json_path}")
     except Exception as e:
         print(f"\n警告: 保存清单失败: {e}")
     success_count = sum(1 for r in results if r.get('status') in ('成功', 'OK'))
     total_count = len(results)
-    print(f"\n共成功处理 {success_count}/{total_count} 个文件")
+    print(f"共成功处理 {success_count}/{total_count} 个文件")
 
 
 def run_analysis_on_file(filepath, max_peaks=10, label=None):
@@ -198,6 +229,58 @@ def run_analysis_on_file(filepath, max_peaks=10, label=None):
     analysis['filepath'] = filepath
     analysis['channels'] = channels
     return analysis, signal, sample_rate, channels
+
+
+def _batch_common_setup(args, op_label, op_type=None):
+    input_dir = args.input
+    output_dir = args.output
+    if not output_dir:
+        suffix = {'analyze': 'analysis_out', 'filter': 'filtered_out',
+                  'gain': 'gain_out', 'echo': 'echo_out',
+                  'process': 'processed_out', 'normalize': 'normalize_out'}
+        output_dir = os.path.join(input_dir, suffix.get(op_type, 'out'))
+
+    recursive = getattr(args, 'recursive', False)
+    dry_run = getattr(args, 'dry_run', False)
+    preserve = getattr(args, 'preserve_name', True)
+
+    wav_files = find_wav_files(input_dir, recursive=recursive)
+    if not wav_files:
+        print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
+        sys.exit(1)
+
+    args._input_dir = input_dir
+    args._output_dir = output_dir
+    args._preserve_name = preserve
+
+    steps_list = describe_process_steps(args) if op_type != 'analyze' else []
+    steps_str = " → ".join(steps_list) if steps_list else op_label
+
+    if dry_run:
+        print_dry_run_plan(wav_files, output_dir, steps_str, args=args, op_type=op_type)
+        return None
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n批量{op_label}: {input_dir}" + (" (递归)" if recursive else ""))
+    print(f"处理步骤: {steps_str}")
+    print(f"找到 {len(wav_files)} 个 WAV 文件")
+    print(f"输出目录: {output_dir}")
+
+    return wav_files, output_dir, steps_str
+
+
+def _compute_output_path(filepath, input_dir, output_dir, args, op_type=None):
+    rel = os.path.relpath(filepath, input_dir)
+    fname = os.path.basename(filepath)
+    out_name = build_output_filename(fname, args, op_type=op_type)
+    rel_dir = os.path.dirname(rel)
+    if rel_dir:
+        out_path = os.path.join(output_dir, rel_dir, out_name)
+    else:
+        out_path = os.path.join(output_dir, out_name)
+    return out_path, rel
 
 
 def run_generate(args):
@@ -262,31 +345,20 @@ def run_analyze(args):
 
 
 def run_batch_analyze(args):
-    input_dir = args.input
-    output_dir = args.output if args.output else os.path.join(input_dir, 'analysis_out')
-    os.makedirs(output_dir, exist_ok=True)
-
-    wav_files = find_wav_files(input_dir)
-    if not wav_files:
-        print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
-        sys.exit(1)
-
-    steps_str = "频谱分析"
-
-    if getattr(args, 'dry_run', False):
-        print_dry_run_plan(wav_files, output_dir, steps_str)
+    setup = _batch_common_setup(args, '频谱分析', op_type='analyze')
+    if setup is None:
         return None, None
-
-    print(f"\n批量分析目录: {input_dir}")
-    print(f"找到 {len(wav_files)} 个 WAV 文件")
-    print(f"输出目录: {output_dir}")
+    wav_files, output_dir, steps_str = setup
+    input_dir = args._input_dir
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
+        out_path, rel = _compute_output_path(filepath, input_dir, output_dir, args, op_type='analyze')
         fname = os.path.basename(filepath)
-        print(f"\n[{i}/{len(wav_files)}] 处理: {fname}")
+        print(f"\n[{i}/{len(wav_files)}] 处理: {rel}")
         result = {
             'filename': fname,
+            'relative_path': rel,
             'input_path': os.path.abspath(filepath),
             'output_path': '',
             'steps': steps_str,
@@ -294,24 +366,23 @@ def run_batch_analyze(args):
         }
         try:
             analysis, signal, sr, ch = run_analysis_on_file(
-                filepath, max_peaks=args.max_peaks, label=fname)
+                filepath, max_peaks=args.max_peaks, label=rel)
             result.update({
-                'sample_rate': sr,
-                'duration': analysis['duration'],
-                'channels': ch,
-                'rms_in': analysis['rms'],
-                'rms_out': analysis['rms'],
-                'rms_change_db': 0.0,
-                'peak_in': analysis['peak'],
-                'peak_out': analysis['peak'],
+                'sample_rate': sr, 'duration': analysis['duration'], 'channels': ch,
+                'rms_in': analysis['rms'], 'rms_out': analysis['rms'],
+                'rms_change_db': 0.0, 'peak_in': analysis['peak'], 'peak_out': analysis['peak'],
                 'dominant_in': round(analysis['dominant_freq'], 2),
                 'dominant_out': round(analysis['dominant_freq'], 2),
             })
-
             csv_name = os.path.splitext(fname)[0] + '.csv'
-            csv_path = os.path.join(output_dir, csv_name)
+            rel_dir = os.path.dirname(rel)
+            if rel_dir:
+                csv_path = os.path.join(output_dir, rel_dir, csv_name)
+            else:
+                csv_path = os.path.join(output_dir, csv_name)
             result['output_path'] = os.path.abspath(csv_path)
             if getattr(args, 'csv_each', False):
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
                 export_spectrum_csv(csv_path, analysis, signal=signal,
                                    sample_rate=sr,
                                    include_full_spectrum=getattr(args, 'full_csv', False))
@@ -322,32 +393,9 @@ def run_batch_analyze(args):
             print(f"  跳过 (错误: {e})")
         results.append(result)
 
-    if results:
-        summary_csv = os.path.join(output_dir, 'summary.csv')
-        with open(summary_csv, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f)
-            writer.writerow(['文件名', '采样率', '采样点数', '时长(s)', 'RMS',
-                           '峰值', '峰值(dB)', '峰值/RMS比', '主导频率(Hz)',
-                           '低频能量%', '中频能量%', '高频能量%'])
-            for i, r in enumerate(results):
-                if r['status'] == '成功':
-                    _, signal, sr, _ = run_analysis_on_file(wav_files[i], max_peaks=args.max_peaks)
-                    a = analyze_signal_full(signal, sr)
-                    writer.writerow([
-                        r['filename'], r['sample_rate'], a['n_samples'],
-                        f"{a['duration']:.4f}", f"{a['rms']:.6f}",
-                        f"{a['peak']:.6f}", f"{a['peak_db']:.2f}",
-                        f"{a['crest_factor']:.4f}", f"{a['dominant_freq']:.2f}",
-                        f"{a['band_energy_low']*100:.2f}",
-                        f"{a['band_energy_mid']*100:.2f}",
-                        f"{a['band_energy_high']*100:.2f}",
-                    ])
-                else:
-                    writer.writerow([r['filename']] + [''] * 11)
-        print(f"\n汇总表已保存到: {summary_csv}")
-
     extra_info = {'任务类型': '频谱分析', '输入目录': input_dir, '输出目录': output_dir}
-    finalize_batch_results(results, output_dir, extra_info=extra_info)
+    finalize_batch_results(results, output_dir, extra_info=extra_info,
+                           dry_run=getattr(args, 'dry_run', False))
     return None, None
 
 
@@ -436,81 +484,52 @@ def run_filter(args):
 
 
 def run_batch_filter(args):
-    input_dir = args.input
-    output_dir = args.output if args.output else os.path.join(input_dir, 'filtered_out')
-    os.makedirs(output_dir, exist_ok=True)
-
-    wav_files = find_wav_files(input_dir)
-    if not wav_files:
-        print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
-        sys.exit(1)
-
     ftype_label = '低通' if args.type == 'lowpass' else '高通'
-    steps_list = describe_process_steps(args)
-    steps_str = " → ".join(steps_list) if steps_list else f"{ftype_label}{int(args.cutoff)}Hz"
-
-    if getattr(args, 'dry_run', False):
-        print_dry_run_plan(wav_files, output_dir, steps_str)
+    setup = _batch_common_setup(args, f'{ftype_label}滤波', op_type='filter')
+    if setup is None:
         return None, None
-
-    print(f"\n批量{ftype_label}滤波目录: {input_dir}")
-    print(f"截止频率: {args.cutoff} Hz, 方式: {args.domain}")
-    print(f"处理步骤: {steps_str}")
-    print(f"找到 {len(wav_files)} 个 WAV 文件")
-    print(f"输出目录: {output_dir}")
+    wav_files, output_dir, steps_str = setup
+    input_dir = args._input_dir
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
+        out_path, rel = _compute_output_path(filepath, input_dir, output_dir, args, op_type='filter')
         fname = os.path.basename(filepath)
-        out_name = build_output_filename(fname, args, op_type='filter')
-        out_path = os.path.join(output_dir, out_name)
-
-        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        out_rel = os.path.relpath(out_path, output_dir)
+        print(f"\n[{i}/{len(wav_files)}] 处理: {rel} → {out_rel}")
         result = {
-            'filename': fname,
-            'input_path': os.path.abspath(filepath),
-            'output_path': os.path.abspath(out_path),
-            'steps': steps_str,
-            'status': '处理中',
+            'filename': fname, 'relative_path': rel,
+            'input_path': os.path.abspath(filepath), 'output_path': os.path.abspath(out_path),
+            'steps': steps_str, 'status': '处理中',
         }
         try:
             signal, sr, ch = read_wav(filepath)
             rms_in = compute_signal_rms(signal)
             a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
-
             if args.type == 'lowpass':
                 if args.domain == 'freq':
                     filtered = apply_freq_filter(signal, sr, args.cutoff, 'lowpass')
                 else:
                     kernel = create_lowpass_kernel(args.cutoff, sr,
-                                                    kernel_size=args.kernel_size,
-                                                    window_type=args.window)
+                                                    kernel_size=args.kernel_size, window_type=args.window)
                     filtered = apply_time_filter(signal, kernel)
             else:
                 if args.domain == 'freq':
                     filtered = apply_freq_filter(signal, sr, args.cutoff, 'highpass')
                 else:
                     kernel = create_highpass_kernel(args.cutoff, sr,
-                                                  kernel_size=args.kernel_size,
-                                                  window_type=args.window)
+                                                  kernel_size=args.kernel_size, window_type=args.window)
                     filtered = apply_time_filter(signal, kernel)
-
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             write_wav(out_path, filtered, sr, n_channels=ch)
-
             rms_out = compute_signal_rms(filtered)
             a_out = analyze_signal_full(filtered, sr, max_peaks=args.max_peaks)
-
             result.update({
-                'sample_rate': sr,
-                'duration': a_in['duration'],
-                'channels': ch,
-                'rms_in': rms_in,
-                'rms_out': rms_out,
+                'sample_rate': sr, 'duration': a_in['duration'], 'channels': ch,
+                'rms_in': rms_in, 'rms_out': rms_out,
                 'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
-                'peak_in': a_in['peak'],
-                'peak_out': a_out['peak'],
-                'dominant_in': round(a_in['dominant_freq'], 2),
-                'dominant_out': round(a_out['dominant_freq'], 2),
+                'peak_in': a_in['peak'], 'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2), 'dominant_out': round(a_out['dominant_freq'], 2),
                 'status': '成功',
             })
         except Exception as e:
@@ -519,14 +538,10 @@ def run_batch_filter(args):
             print(f"  跳过 (错误: {e})")
         results.append(result)
 
-    extra_info = {
-        '任务类型': f'{ftype_label}滤波',
-        '截止频率(Hz)': args.cutoff,
-        '实现方式': args.domain,
-        '输入目录': input_dir,
-        '输出目录': output_dir,
-    }
-    finalize_batch_results(results, output_dir, extra_info=extra_info)
+    extra_info = {'任务类型': f'{ftype_label}滤波', '截止频率(Hz)': args.cutoff,
+                  '实现方式': args.domain, '输入目录': input_dir, '输出目录': output_dir}
+    finalize_batch_results(results, output_dir, extra_info=extra_info,
+                           dry_run=getattr(args, 'dry_run', False))
     return None, None
 
 
@@ -561,63 +576,36 @@ def run_gain(args):
 
 
 def run_batch_gain(args):
-    input_dir = args.input
-    output_dir = args.output if args.output else os.path.join(input_dir, 'gain_out')
-    os.makedirs(output_dir, exist_ok=True)
-
-    wav_files = find_wav_files(input_dir)
-    if not wav_files:
-        print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
-        sys.exit(1)
-
-    steps_list = describe_process_steps(args)
-    steps_str = " → ".join(steps_list)
-
-    if getattr(args, 'dry_run', False):
-        print_dry_run_plan(wav_files, output_dir, steps_str)
+    setup = _batch_common_setup(args, '增益调整', op_type='gain')
+    if setup is None:
         return None, None
-
-    print(f"\n批量增益调整: {args.gain:+.2f} dB")
-    print(f"处理步骤: {steps_str}")
-    print(f"输入目录: {input_dir}")
-    print(f"找到 {len(wav_files)} 个 WAV 文件")
-    print(f"输出目录: {output_dir}")
+    wav_files, output_dir, steps_str = setup
+    input_dir = args._input_dir
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
+        out_path, rel = _compute_output_path(filepath, input_dir, output_dir, args, op_type='gain')
         fname = os.path.basename(filepath)
-        out_name = build_output_filename(fname, args, op_type='gain')
-        out_path = os.path.join(output_dir, out_name)
-
-        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        out_rel = os.path.relpath(out_path, output_dir)
+        print(f"\n[{i}/{len(wav_files)}] 处理: {rel} → {out_rel}")
         result = {
-            'filename': fname,
-            'input_path': os.path.abspath(filepath),
-            'output_path': os.path.abspath(out_path),
-            'steps': steps_str,
-            'status': '处理中',
+            'filename': fname, 'relative_path': rel,
+            'input_path': os.path.abspath(filepath), 'output_path': os.path.abspath(out_path),
+            'steps': steps_str, 'status': '处理中',
         }
         try:
             signal, sr, ch = read_wav(filepath)
             a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
             gained = apply_gain(signal, args.gain)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             write_wav(out_path, gained, sr, n_channels=ch)
             a_out = analyze_signal_full(gained, sr, max_peaks=args.max_peaks)
-
-            rms_in = a_in['rms']
-            rms_out = a_out['rms']
-
             result.update({
-                'sample_rate': sr,
-                'duration': a_in['duration'],
-                'channels': ch,
-                'rms_in': rms_in,
-                'rms_out': rms_out,
-                'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
-                'peak_in': a_in['peak'],
-                'peak_out': a_out['peak'],
-                'dominant_in': round(a_in['dominant_freq'], 2),
-                'dominant_out': round(a_out['dominant_freq'], 2),
+                'sample_rate': sr, 'duration': a_in['duration'], 'channels': ch,
+                'rms_in': a_in['rms'], 'rms_out': a_out['rms'],
+                'rms_change_db': 20 * math.log10(a_out['rms'] / a_in['rms']) if a_in['rms'] > 0 else 0,
+                'peak_in': a_in['peak'], 'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2), 'dominant_out': round(a_out['dominant_freq'], 2),
                 'status': '成功',
             })
         except Exception as e:
@@ -626,13 +614,10 @@ def run_batch_gain(args):
             print(f"  跳过 (错误: {e})")
         results.append(result)
 
-    extra_info = {
-        '任务类型': '增益调整',
-        '增益(dB)': args.gain,
-        '输入目录': input_dir,
-        '输出目录': output_dir,
-    }
-    finalize_batch_results(results, output_dir, extra_info=extra_info)
+    extra_info = {'任务类型': '增益调整', '增益(dB)': args.gain,
+                  '输入目录': input_dir, '输出目录': output_dir}
+    finalize_batch_results(results, output_dir, extra_info=extra_info,
+                           dry_run=getattr(args, 'dry_run', False))
     return None, None
 
 
@@ -671,64 +656,37 @@ def run_echo(args):
 
 
 def run_batch_echo(args):
-    input_dir = args.input
-    output_dir = args.output if args.output else os.path.join(input_dir, 'echo_out')
-    os.makedirs(output_dir, exist_ok=True)
-
-    wav_files = find_wav_files(input_dir)
-    if not wav_files:
-        print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
-        sys.exit(1)
-
-    steps_list = describe_process_steps(args)
-    steps_str = " → ".join(steps_list)
     echo_type = "反馈式" if args.feedback else "单次"
-
-    if getattr(args, 'dry_run', False):
-        print_dry_run_plan(wav_files, output_dir, steps_str)
+    setup = _batch_common_setup(args, f'{echo_type}回声', op_type='echo')
+    if setup is None:
         return None, None
-
-    print(f"\n批量回声效果: {echo_type} 延迟 {args.delay}ms, 衰减 {args.decay}")
-    print(f"处理步骤: {steps_str}")
-    print(f"输入目录: {input_dir}")
-    print(f"找到 {len(wav_files)} 个 WAV 文件")
-    print(f"输出目录: {output_dir}")
+    wav_files, output_dir, steps_str = setup
+    input_dir = args._input_dir
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
+        out_path, rel = _compute_output_path(filepath, input_dir, output_dir, args, op_type='echo')
         fname = os.path.basename(filepath)
-        out_name = build_output_filename(fname, args, op_type='echo')
-        out_path = os.path.join(output_dir, out_name)
-
-        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        out_rel = os.path.relpath(out_path, output_dir)
+        print(f"\n[{i}/{len(wav_files)}] 处理: {rel} → {out_rel}")
         result = {
-            'filename': fname,
-            'input_path': os.path.abspath(filepath),
-            'output_path': os.path.abspath(out_path),
-            'steps': steps_str,
-            'status': '处理中',
+            'filename': fname, 'relative_path': rel,
+            'input_path': os.path.abspath(filepath), 'output_path': os.path.abspath(out_path),
+            'steps': steps_str, 'status': '处理中',
         }
         try:
             signal, sr, ch = read_wav(filepath)
             a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
             echoed = apply_echo(signal, sr, args.delay, args.decay, feedback=args.feedback)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             write_wav(out_path, echoed, sr, n_channels=ch)
             a_out = analyze_signal_full(echoed, sr, max_peaks=args.max_peaks)
-
-            rms_in = a_in['rms']
-            rms_out = a_out['rms']
-
             result.update({
-                'sample_rate': sr,
-                'duration': a_in['duration'],
-                'channels': ch,
-                'rms_in': rms_in,
-                'rms_out': rms_out,
-                'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
-                'peak_in': a_in['peak'],
-                'peak_out': a_out['peak'],
-                'dominant_in': round(a_in['dominant_freq'], 2),
-                'dominant_out': round(a_out['dominant_freq'], 2),
+                'sample_rate': sr, 'duration': a_in['duration'], 'channels': ch,
+                'rms_in': a_in['rms'], 'rms_out': a_out['rms'],
+                'rms_change_db': 20 * math.log10(a_out['rms'] / a_in['rms']) if a_in['rms'] > 0 else 0,
+                'peak_in': a_in['peak'], 'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2), 'dominant_out': round(a_out['dominant_freq'], 2),
                 'status': '成功',
             })
         except Exception as e:
@@ -737,15 +695,136 @@ def run_batch_echo(args):
             print(f"  跳过 (错误: {e})")
         results.append(result)
 
-    extra_info = {
-        '任务类型': '回声效果',
-        '延迟(ms)': args.delay,
-        '衰减系数': args.decay,
-        '反馈模式': '开启' if args.feedback else '关闭',
-        '输入目录': input_dir,
-        '输出目录': output_dir,
-    }
-    finalize_batch_results(results, output_dir, extra_info=extra_info)
+    extra_info = {'任务类型': '回声效果', '延迟(ms)': args.delay, '衰减系数': args.decay,
+                  '反馈模式': '开启' if args.feedback else '关闭',
+                  '输入目录': input_dir, '输出目录': output_dir}
+    finalize_batch_results(results, output_dir, extra_info=extra_info,
+                           dry_run=getattr(args, 'dry_run', False))
+    return None, None
+
+
+def run_normalize(args):
+    if os.path.isdir(args.input):
+        return run_batch_normalize(args)
+
+    print_sep()
+    print("  音频信号处理工具 - 响度整理")
+    print_sep()
+
+    signal, sr, ch = read_wav(args.input)
+    rms_in = compute_signal_rms(signal)
+    peak_in = compute_signal_peak(signal)
+    a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
+
+    print(f"\n输入: {args.input}")
+    print(f"  RMS: {rms_in:.6f}  峰值: {peak_in:.6f}  时长: {a_in['duration']:.2f}s")
+
+    adjusted_db = 0.0
+    clipped = False
+    limited_count = 0
+
+    if args.target_rms is not None:
+        result_sig, adjusted_db, clipped = normalize_to_rms(signal, args.target_rms)
+        print(f"\n  → RMS 归一化: 目标 {args.target_rms:.4f}")
+    elif args.target_peak is not None:
+        result_sig, adjusted_db = normalize_to_peak(signal, args.target_peak)
+        print(f"\n  → 峰值归一化: 目标 {args.target_peak:.4f}")
+    elif args.limiter is not None:
+        result_sig, limited_count = apply_limiter(signal, threshold=args.limiter)
+        print(f"\n  → 峰值限幅: 阈值 {args.limiter:.4f}")
+
+    rms_out = compute_signal_rms(result_sig)
+    peak_out = compute_signal_peak(result_sig)
+    a_out = analyze_signal_full(result_sig, sr, max_peaks=args.max_peaks)
+
+    print(f"  调整量: {adjusted_db:+.2f} dB")
+    if clipped:
+        print(f"  ⚠ 输出被限幅 (归一化后峰值超过 1.0, 已自动衰减)")
+    if limited_count > 0:
+        print(f"  限幅采样点: {limited_count} ({limited_count/len(signal)*100:.2f}%)")
+    print(f"  输出 RMS: {rms_out:.6f}  峰值: {peak_out:.6f}")
+
+    print(f"\n处理前后对比:")
+    print(format_analysis_summary(a_in, show_peaks=True))
+    print("  ↓ 处理后 ↓")
+    print(format_analysis_summary(a_out, show_peaks=True))
+
+    if args.output:
+        write_wav(args.output, result_sig, sr, n_channels=ch)
+        print(f"\n已保存到: {args.output}")
+
+    return result_sig, sr
+
+
+def run_batch_normalize(args):
+    mode_desc = ''
+    if args.target_rms is not None:
+        mode_desc = f'RMS归一化→{args.target_rms:.4f}'
+    elif args.target_peak is not None:
+        mode_desc = f'峰值归一化→{args.target_peak:.4f}'
+    elif args.limiter is not None:
+        mode_desc = f'峰值限幅@{args.limiter:.4f}'
+
+    setup = _batch_common_setup(args, f'响度整理({mode_desc})', op_type='normalize')
+    if setup is None:
+        return None, None
+    wav_files, output_dir, steps_str = setup
+    input_dir = args._input_dir
+
+    results = []
+    for i, filepath in enumerate(wav_files, 1):
+        out_path, rel = _compute_output_path(filepath, input_dir, output_dir, args, op_type='normalize')
+        fname = os.path.basename(filepath)
+        out_rel = os.path.relpath(out_path, output_dir)
+        print(f"\n[{i}/{len(wav_files)}] 处理: {rel} → {out_rel}")
+        result = {
+            'filename': fname, 'relative_path': rel,
+            'input_path': os.path.abspath(filepath), 'output_path': os.path.abspath(out_path),
+            'steps': steps_str, 'status': '处理中',
+        }
+        try:
+            signal, sr, ch = read_wav(filepath)
+            a_in = analyze_signal_full(signal, sr, max_peaks=args.max_peaks)
+            rms_in = a_in['rms']
+            peak_in = a_in['peak']
+
+            adjusted_db = 0.0
+            clipped = False
+            limited_count = 0
+
+            if args.target_rms is not None:
+                result_sig, adjusted_db, clipped = normalize_to_rms(signal, args.target_rms)
+            elif args.target_peak is not None:
+                result_sig, adjusted_db = normalize_to_peak(signal, args.target_peak)
+            elif args.limiter is not None:
+                result_sig, limited_count = apply_limiter(signal, threshold=args.limiter)
+
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            write_wav(out_path, result_sig, sr, n_channels=ch)
+            a_out = analyze_signal_full(result_sig, sr, max_peaks=args.max_peaks)
+
+            result.update({
+                'sample_rate': sr, 'duration': a_in['duration'], 'channels': ch,
+                'rms_in': rms_in, 'rms_out': a_out['rms'],
+                'rms_change_db': adjusted_db,
+                'peak_in': peak_in, 'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2),
+                'dominant_out': round(a_out['dominant_freq'], 2),
+                'adjusted_db': round(adjusted_db, 2),
+                'clipped': clipped,
+                'limited_count': limited_count,
+                'status': '成功',
+            })
+        except Exception as e:
+            result['status'] = '失败'
+            result['error_msg'] = str(e)
+            print(f"  跳过 (错误: {e})")
+        results.append(result)
+
+    extra_info = {'任务类型': '响度整理', '模式': mode_desc,
+                  '输入目录': input_dir, '输出目录': output_dir}
+    finalize_batch_results(results, output_dir, extra_info=extra_info,
+                           dry_run=getattr(args, 'dry_run', False))
     return None, None
 
 
@@ -884,45 +963,27 @@ def run_process(args):
 
 
 def run_batch_process(args):
-    input_dir = args.input
-    output_dir = args.output if args.output else os.path.join(input_dir, 'processed_out')
-    os.makedirs(output_dir, exist_ok=True)
-
-    wav_files = find_wav_files(input_dir)
-    if not wav_files:
-        print(f"错误: 目录中没有找到 WAV 文件: {input_dir}")
-        sys.exit(1)
-
     if args.preset:
         presets = load_presets(args.preset_file)
         overwrite = getattr(args, 'preset_overwrite', True)
         apply_preset_to_args(args, args.preset, presets, overwrite=overwrite)
 
-    steps_list = describe_process_steps(args)
-    steps_str = " → ".join(steps_list) if steps_list else "(仅读写)"
-
-    if getattr(args, 'dry_run', False):
-        print_dry_run_plan(wav_files, output_dir, steps_str)
+    setup = _batch_common_setup(args, '完整处理流水线', op_type='process')
+    if setup is None:
         return None, None
-
-    print(f"\n批量处理目录: {input_dir}")
-    print(f"处理步骤: {steps_str}")
-    print(f"找到 {len(wav_files)} 个 WAV 文件")
-    print(f"输出目录: {output_dir}")
+    wav_files, output_dir, steps_str = setup
+    input_dir = args._input_dir
 
     results = []
     for i, filepath in enumerate(wav_files, 1):
+        out_path, rel = _compute_output_path(filepath, input_dir, output_dir, args, op_type='process')
         fname = os.path.basename(filepath)
-        out_name = build_output_filename(fname, args, op_type='process')
-        out_path = os.path.join(output_dir, out_name)
-
-        print(f"\n[{i}/{len(wav_files)}] 处理: {fname} → {out_name}")
+        out_rel = os.path.relpath(out_path, output_dir)
+        print(f"\n[{i}/{len(wav_files)}] 处理: {rel} → {out_rel}")
         result = {
-            'filename': fname,
-            'input_path': os.path.abspath(filepath),
-            'output_path': os.path.abspath(out_path),
-            'steps': steps_str,
-            'status': '处理中',
+            'filename': fname, 'relative_path': rel,
+            'input_path': os.path.abspath(filepath), 'output_path': os.path.abspath(out_path),
+            'steps': steps_str, 'status': '处理中',
         }
         try:
             signal, sr, ch = read_wav(filepath)
@@ -934,8 +995,7 @@ def run_batch_process(args):
                     current = apply_freq_filter(current, sr, args.highpass, 'highpass')
                 else:
                     kernel = create_highpass_kernel(args.highpass, sr,
-                                                  kernel_size=args.kernel_size,
-                                                  window_type=args.window)
+                                                  kernel_size=args.kernel_size, window_type=args.window)
                     current = apply_time_filter(current, kernel)
 
             if args.lowpass is not None:
@@ -943,8 +1003,7 @@ def run_batch_process(args):
                     current = apply_freq_filter(current, sr, args.lowpass, 'lowpass')
                 else:
                     kernel = create_lowpass_kernel(args.lowpass, sr,
-                                                   kernel_size=args.kernel_size,
-                                                   window_type=args.window)
+                                                   kernel_size=args.kernel_size, window_type=args.window)
                     current = apply_time_filter(current, kernel)
 
             if args.gain != 0:
@@ -954,23 +1013,16 @@ def run_batch_process(args):
                 current = apply_echo(current, sr, args.echo_delay, args.echo_decay,
                                     feedback=args.echo_feedback)
 
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
             write_wav(out_path, current, sr, n_channels=ch)
             a_out = analyze_signal_full(current, sr, max_peaks=args.max_peaks)
 
-            rms_in = a_in['rms']
-            rms_out = a_out['rms']
-
             result.update({
-                'sample_rate': sr,
-                'duration': a_in['duration'],
-                'channels': ch,
-                'rms_in': rms_in,
-                'rms_out': rms_out,
-                'rms_change_db': 20 * math.log10(rms_out / rms_in) if rms_in > 0 else 0,
-                'peak_in': a_in['peak'],
-                'peak_out': a_out['peak'],
-                'dominant_in': round(a_in['dominant_freq'], 2),
-                'dominant_out': round(a_out['dominant_freq'], 2),
+                'sample_rate': sr, 'duration': a_in['duration'], 'channels': ch,
+                'rms_in': a_in['rms'], 'rms_out': a_out['rms'],
+                'rms_change_db': 20 * math.log10(a_out['rms'] / a_in['rms']) if a_in['rms'] > 0 else 0,
+                'peak_in': a_in['peak'], 'peak_out': a_out['peak'],
+                'dominant_in': round(a_in['dominant_freq'], 2), 'dominant_out': round(a_out['dominant_freq'], 2),
                 'status': '成功',
             })
         except Exception as e:
@@ -979,15 +1031,12 @@ def run_batch_process(args):
             print(f"  跳过 (错误: {e})")
         results.append(result)
 
-    extra_info = {
-        '任务类型': '完整处理流水线',
-        '处理步骤': steps_str,
-        '输入目录': input_dir,
-        '输出目录': output_dir,
-    }
+    extra_info = {'任务类型': '完整处理流水线', '处理步骤': steps_str,
+                  '输入目录': input_dir, '输出目录': output_dir}
     if args.preset:
         extra_info['使用预设'] = args.preset
-    finalize_batch_results(results, output_dir, extra_info=extra_info)
+    finalize_batch_results(results, output_dir, extra_info=extra_info,
+                           dry_run=getattr(args, 'dry_run', False))
     return None, None
 
 
@@ -1059,6 +1108,10 @@ def add_common_input_args(parser, add_output=True):
                         help="批量输出时保留原文件名 (默认)")
     parser.add_argument("--no-preserve-name", dest="preserve_name", action="store_false",
                         help="批量输出时在文件名前加处理类型前缀")
+    parser.add_argument("--recursive", action="store_true",
+                        help="递归扫描子目录")
+    parser.add_argument("--csv-each", action="store_true",
+                        help="批处理时为每个文件导出 CSV")
 
 
 def main():
@@ -1120,8 +1173,6 @@ def main():
     # ============ analyze ============
     p_ana = subparsers.add_parser("analyze", help="频谱分析")
     add_common_input_args(p_ana)
-    p_ana.add_argument("--csv-each", action="store_true",
-                        help="批量时为每个文件导出 CSV")
 
     # ============ filter ============
     p_filt = subparsers.add_parser("filter", help="低通/高通滤波")
@@ -1149,6 +1200,27 @@ def main():
     p_echo.add_argument("--delay", type=float, default=200, help="延迟时间 ms")
     p_echo.add_argument("--decay", type=float, default=0.5, help="衰减系数 0-1")
     p_echo.add_argument("--feedback", action="store_true", help="启用反馈回声")
+
+    # ============ normalize ============
+    p_norm = subparsers.add_parser("normalize", help="响度整理：统一音量/峰值限幅")
+    p_norm.add_argument("-i", "--input", required=True, help="输入 WAV 文件或目录")
+    p_norm.add_argument("-o", "--output", type=str, default=None, help="输出路径")
+    norm_mode = p_norm.add_mutually_exclusive_group(required=True)
+    norm_mode.add_argument("--target-rms", type=float, default=None,
+                           help="目标 RMS 值 (如 0.1)")
+    norm_mode.add_argument("--target-peak", type=float, default=None,
+                           help="目标峰值 (如 0.95, 归一化到指定峰值)")
+    norm_mode.add_argument("--limiter", type=float, default=None, nargs='?',
+                           const=0.95, help="峰值限幅阈值 (默认 0.95)")
+    p_norm.add_argument("--max-peaks", type=int, default=10, help="峰值数")
+    p_norm.add_argument("--dry-run", action="store_true", help="仅显示执行计划")
+    p_norm.add_argument("--preserve-name", dest="preserve_name", action="store_true", default=True,
+                        help="批量输出保留原文件名 (默认)")
+    p_norm.add_argument("--no-preserve-name", dest="preserve_name", action="store_false",
+                        help="批量输出加前缀")
+    p_norm.add_argument("--recursive", action="store_true", help="递归扫描子目录")
+    p_norm.add_argument("--preset-file", type=str, default='custom_presets.json',
+                        help="自定义预设文件")
 
     # ============ process ============
     p_proc = subparsers.add_parser("process", help="完整处理管道")
@@ -1193,6 +1265,7 @@ def main():
                         help="批量输出保留原文件名 (默认)")
     p_proc.add_argument("--no-preserve-name", dest="preserve_name", action="store_false",
                         help="批量输出加前缀")
+    p_proc.add_argument("--recursive", action="store_true", help="递归扫描子目录")
 
     # ============ presets ============
     p_pre = subparsers.add_parser("presets", help="预设管理")
@@ -1226,6 +1299,7 @@ def main():
         "filter": run_filter,
         "gain": run_gain,
         "echo": run_echo,
+        "normalize": run_normalize,
         "process": run_process,
     }
 
